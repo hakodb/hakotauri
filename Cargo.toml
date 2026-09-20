@@ -1,0 +1,28 @@
+[package]
+name = "firelite-tauri"
+version = "0.1.1"
+edition = "2021"
+description = "Tauri gateway commands for the FireLite embedded document engine"
+
+[lib]
+name = "firelite_tauri"
+path = "src/lib.rs"
+
+[dependencies]
+# Pinned to the firelite core branch until the first crates.io release,
+# then switch to `version = "0.8"`. Default features off on purpose: the
+# gateway uses engine/query/document only, proving sync is not required.
+firelite = { git = "https://github.com/rizaptk/firelite.git", branch = "cloud_sync", default-features = false }
+tauri = { version = "=2.10.3" }
+# Pinned as a triple: the in-tree gateway build was green on exactly
+# tauri 2.10.3 + macros 2.5.5 + runtime 2.10.1. Newer macros (2.6.x)
+# emit a doubled #[macro_export] that rustc rejects with E0255, and a
+# newer runtime breaks tauri 2.10.3 (Send vs Send+Sync drift).
+tauri-macros = { version = "=2.5.5" }
+tauri-runtime = { version = "=2.10.1" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+rayon = "1.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1.3"
+parking_lot = "0.12"
