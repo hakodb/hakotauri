@@ -1,4 +1,4 @@
-# hako-tauri
+# hakotauri
 
 Tauri gateway commands for
 HakoDB: exposes the engine
@@ -7,7 +7,7 @@ for the `@hakodb/tauri` TypeScript client.
 
 ## Compatibility
 
-| hako-tauri | hako core | tauri |
+| hakotauri | hako core | tauri |
 |---|---|---|
 | 0.1.1 | `cloud_sync` branch / `v0.8.20`+ release asset | =2.10.3 (pinned triple, see below) |
 
@@ -15,9 +15,9 @@ for the `@hakodb/tauri` TypeScript client.
 
 ```rust
 tauri::Builder::default()
-    .manage(hako_tauri::HakoGateway::new(db))
+    .manage(hakotauri::HakoGateway::new(db))
     .invoke_handler(tauri::generate_handler![
-        hako_tauri::gateway::hako_exec
+        hakotauri::gateway::hako_exec
     ])
 ```
 
