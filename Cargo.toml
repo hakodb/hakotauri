@@ -9,10 +9,10 @@ name = "firelite_tauri"
 path = "src/lib.rs"
 
 [dependencies]
-# Pinned to the firelite core branch until the first crates.io release,
+# Pinned to the core branch until the first crates.io release,
 # then switch to `version = "0.8"`. Default features off on purpose: the
 # gateway uses engine/query/document only, proving sync is not required.
-firelite = { git = "https://github.com/rizaptk/firelite.git", branch = "cloud_sync", default-features = false }
+hakodb = { git = "https://github.com/rizaptk/firelite.git", branch = "cloud_sync", default-features = false }
 tauri = { version = "=2.10.3" }
 # Pinned as a triple: the in-tree gateway build was green on exactly
 # tauri 2.10.3 + macros 2.5.5 + runtime 2.10.1. Newer macros (2.6.x)

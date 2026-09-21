@@ -1,4 +1,4 @@
-//! Tauri gateway commands for the FireLite embedded document engine.
+//! Tauri gateway commands for the Hako embedded document engine.
 //!
 //! The command itself lives in [`gateway`] (a submodule on purpose: the
 //! `#[command]` macro emits a same-named helper macro that collides at the
@@ -16,6 +16,6 @@ mod gateway;
 
 pub use gateway::{
     firelite_exec, AggregateKind, BatchInput, BatchMutationKind, CompositeFieldInput,
-    DeltaKind, DeltaPayload, DocumentChange, FilterInput, FilterOperator, FireLiteGateway,
-    FireLiteOp, FireLiteResponse, OrderByInput, QueryAction, RawRow,
+    DeltaKind, DeltaPayload, DocumentChange, FilterInput, FilterOperator, HakoGateway,
+    HakoOp, HakoResponse, OrderByInput, QueryAction, RawRow,
 };
