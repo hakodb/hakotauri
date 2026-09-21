@@ -1,11 +1,11 @@
 [package]
-name = "firelite-tauri"
+name = "hako-tauri"
 version = "0.1.1"
 edition = "2021"
-description = "Tauri gateway commands for the FireLite embedded document engine"
+description = "Tauri gateway commands for the HakoDB embedded document engine"
 
 [lib]
-name = "firelite_tauri"
+name = "hako_tauri"
 path = "src/lib.rs"
 
 [dependencies]

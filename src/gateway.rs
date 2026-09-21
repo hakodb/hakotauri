@@ -470,7 +470,7 @@ pub enum QueryAction {
 }
 
 #[command]
-pub async fn firelite_exec<R: Runtime>(
+pub async fn hako_exec<R: Runtime>(
     _window: Window<R>,
     state: State<'_, HakoGateway>,
     op: HakoOp,
@@ -644,7 +644,8 @@ pub async fn firelite_exec<R: Runtime>(
                     _window,
                     listener_id.clone(),
                     QueryInput { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs: false, local_only: false },
-                    event_name.unwrap_or_else(|| "firelite://snapshot".to_string()),
+                    event_name.unwrap_or_else(||
+                    "hako://snapshot".to_string()),
                 )?;
                 Ok(HakoResponse::SubscriptionAck { listener_id })
             }
