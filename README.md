@@ -1,13 +1,13 @@
-# firelite-tauri
+# hako-tauri
 
 Tauri gateway commands for
-[FireLite](https://github.com/rizaptk/firelite): exposes the engine
+HakoDB: exposes the engine
 (get/set/query/watch/index admin) as binary (MessagePack) Tauri commands
-for the [`@firelite/tauri`](../firelite-tauri-ts) TypeScript client.
+for the `@hakodb/tauri` TypeScript client.
 
 ## Compatibility
 
-| firelite-tauri | firelite core | tauri |
+| hako-tauri | hako core | tauri |
 |---|---|---|
 | 0.1.1 | `cloud_sync` branch / `v0.8.20`+ release asset | =2.10.3 (pinned triple, see below) |
 
@@ -15,22 +15,22 @@ for the [`@firelite/tauri`](../firelite-tauri-ts) TypeScript client.
 
 ```rust
 tauri::Builder::default()
-    .manage(firelite_tauri::FireLiteGateway::new(db))
+    .manage(hako_tauri::HakoGateway::new(db))
     .invoke_handler(tauri::generate_handler![
-        firelite_tauri::gateway::firelite_exec
+        hako_tauri::gateway::hako_exec
     ])
 ```
 
-Use the **module path** (`gateway::firelite_exec`), not the root
+Use the **module path** (`gateway::hako_exec`), not the root
 re-export: the `#[command]` wrapper macro resolves through the same
 module as the function. (The root re-export covers types and direct
 calls.)
 
 ## Watch hot path
 
-Subscriptions prebuild a filter plan once (`FireLite::plan_for_watch`)
+Subscriptions prebuild a filter plan once (`Hako::plan_for_watch`)
 and match per-event bytes with zero decode
-(`FireLite::matches_watch`) — the same cost as the former in-tree
+(`Hako::matches_watch`) — the same cost as the former in-tree
 implementation; only the location moved.
 
 ## Pinned triple
