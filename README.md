@@ -9,7 +9,7 @@ for the `@hakodb/tauri` TypeScript client.
 
 | hakotauri | hako core | tauri |
 |---|---|---|
-| 0.1.1 | `cloud_sync` branch / `v0.8.20`+ release asset | =2.10.3 (pinned triple, see below) |
+| 0.1.1 | `cloud_sync` branch / `v0.8.21`+ release asset | =2.10.3 (pinned triple, see below) |
 
 ## Register
 

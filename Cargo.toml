@@ -1,6 +1,6 @@
 [package]
 name = "hakotauri"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Tauri gateway commands for the HakoDB embedded document engine"
 license = "MIT"
@@ -10,10 +10,9 @@ name = "hakotauri"
 path = "src/lib.rs"
 
 [dependencies]
-# Pinned to the core branch until the first crates.io release,
-# then switch to `version = "0.8"`. Default features off on purpose: the
-# gateway uses engine/query/document only, proving sync is not required.
-hakodb = { git = "https://github.com/hakodb/hakodb.git", branch = "cloud_sync", default-features = false }
+# Sync features on: the net_sync/cloud_sync command modules drive them, so
+# consumers register SDK commands instead of using hakodb directly.
+hakodb = { git = "https://github.com/hakodb/hakodb.git", branch = "cloud_sync", default-features = false, features = ["net-sync", "cloud-sync"] }
 tauri = { version = "=2.10.3" }
 # Pinned as a triple: the in-tree gateway build was green on exactly
 # tauri 2.10.3 + macros 2.5.5 + runtime 2.10.1. Newer macros (2.6.x)
@@ -27,3 +26,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rmp-serde = "1.3"
 parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
