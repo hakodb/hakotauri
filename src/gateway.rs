@@ -1,44 +1,65 @@
+//! The single-command bridge between a Tauri frontend and HakoDB.
+//!
+//! # How it works
+//!
+//! The frontend speaks to exactly one Tauri command, [`hako_exec`], sending a
+//! [`HakoOp`] (JSON, snake_case) and receiving a [`HakoResponse`] as
+//! MessagePack bytes. One command keeps the IPC surface small: new database
+//! features arrive as new `HakoOp` variants, never as new commands.
+//!
+//! # Threading
+//!
+//! The engine is synchronous, so [`hako_exec`] runs every op on a
+//! `spawn_blocking` worker and subscriptions on a dedicated blocking loop per
+//! listener. Tauri events (`window.emit`) carry MessagePack bytes, matching
+//! the request path.
+//!
+//! # Conventions developers should know
+//!
+//! - **snake_case wire**: `HakoOp` uses `#[serde(tag = "op",
+//!   rename_all = "snake_case")]`; flags a client omits default to `false`
+//!   (eager blobs, replicated writes). The `casing_tests` module locks this.
+//! - **ids ride along**: query rows and point reads inject the doc id as an
+//!   `"id"` field in the returned JSON — storage rows don't carry it.
+//! - **JSON `<->` Value**: request data crosses as JSON and is converted to
+//!   engine [`Value`](hakodb::document::value::Value); responses convert
+//!   back, with `Binary` as a number array, references as `{"__ref__":
+//!   "col/id"}`, and unresolved blobs as `{"__blob__": {offset, len}}`.
+//! - **raw bytes are opaque**: [`HakoOp::QueryRaw`] rows cross as storage
+//!   bytes the client must never hand-build; [`HakoOp::DecodeRaw`] turns
+//!   them back into documents server-side.
+
 use std::collections::HashMap;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tauri::{command, Emitter, Runtime, State, Window};
 
+use hakodb::config::DurabilityMode;
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
-use hakodb::engine::{BatchMutation, Hako};
+use hakodb::engine::{AuditEntry, BatchMutation, ChangeKind, Hako};
 use hakodb::index::composite::definition::SortDirection;
-use hakodb::query::filter::Operator;
-use hakodb::query::query::Query;
+use hakodb::query::filter::{Filter, Operator};
+use hakodb::query::query::{AggregateOp, Query};
+use hakodb::util::clock::unix_millis;
 
+/// Encodes any response as MessagePack bytes for the trip back to the
+/// frontend. Raw row bytes inside stay `bin` (Uint8Array on the TS side).
 fn to_binary_payload<S: serde::Serialize>(val: &S) -> Result<Vec<u8>, String> {
-    // let json = serde_json::to_value(val).map_err(|e| e.to_string())?;
-    // let flat_value = json_to_rmpv(json);
-    // rmp_serde::to_vec(&flat_value).map_err(|e| e.to_string())
     rmp_serde::to_vec_named(val).map_err(|e| e.to_string())
 }
 
-// fn json_to_rmpv(json: serde_json::Value) -> rmpv::Value {
-//     match json {
-//         serde_json::Value::Null => rmpv::Value::Nil,
-//         serde_json::Value::Bool(b) => rmpv::Value::Boolean(b),
-//         serde_json::Value::Number(n) => {
-//             if let Some(i) = n.as_i64() { rmpv::Value::Integer(i.into()) }
-//             else { rmpv::Value::F64(n.as_f64().unwrap_or(0.0)) }
-//         }
-//         serde_json::Value::String(s) => rmpv::Value::String(s.into()),
-//         serde_json::Value::Array(arr) => rmpv::Value::Array(arr.into_iter().map(json_to_rmpv).collect()),
-//         serde_json::Value::Object(obj) => rmpv::Value::Map(
-//             obj.into_iter()
-//                .map(|(k, v)| (rmpv::Value::String(k.into()), json_to_rmpv(v)))
-//                .collect()
-//         ),
-//     }
-// }
-
+/// Every operation the frontend can ask for, as one tagged enum.
+///
+/// Serialization is the wire contract: `{"op": "query", ...}` with
+/// snake_case fields. Fields a client omits fall back to serde defaults
+/// (empty filters, `defer_blobs: false`, `local_only: false), so old
+/// clients keep working when new flags are added — see `casing_tests`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum HakoOp {
@@ -48,7 +69,7 @@ pub enum HakoOp {
     Delete {
         collection: String,
         doc_id: String,
-        // ponytail: old clients omit it and get replicated behavior via default.
+        /// When true the tombstone stays on this device (never replicates).
         #[serde(default)]
         local_only: bool,
     },
@@ -72,19 +93,19 @@ pub enum HakoOp {
         start_after: Option<Vec<serde_json::Value>>,
         end_at: Option<Vec<serde_json::Value>>,
         end_before: Option<Vec<serde_json::Value>>,
-        // ponytail: opt-in per-query blob deferral (old clients omit it and
-        // get eager behavior via serde default).
+        // Opt-in per-query blob deferral: list views skip blob-file reads
+        // and get `__blob__` placeholders instead.
         #[serde(default)]
         defer_blobs: bool,
         // Local-only scope for the Delete action (Fetch ignores it).
         #[serde(default)]
         local_only: bool,
     },
-    /// Raw scan (v0.8.7+): pinned storage bytes per row, no decode, no
-    /// JSON. Bytes cross msgpack as bin (Uint8Array on the TS side) and
-    /// stay opaque there G�� hash/count/export them, or send selected rows
-    /// back through DecodeRaw. Page with start_after: [lastId] under an
-    /// id order; ids ride along in the clear.
+    /// Raw scan: pinned storage bytes per row, no decode, no JSON. Bytes
+    /// cross msgpack as bin (Uint8Array on the TS side) and stay opaque
+    /// there: hash/count/export them, or send selected rows back through
+    /// DecodeRaw. Page with start_after: [lastId] under an id order; ids
+    /// ride along in the clear.
     QueryRaw {
         collection: String,
         doc_id_filter: Option<String>,
@@ -99,17 +120,17 @@ pub enum HakoOp {
         end_at: Option<Vec<serde_json::Value>>,
         end_before: Option<Vec<serde_json::Value>>,
     },
-    /// Lazy typed field pull (v0.8.13+): point view + one field, no
-    /// decode, no JSON document. Scalars cross as JSON values;
-    /// missing/wrong-type reads null. BlobLink fields surface their
-    /// placeholder (resolve the doc via DecodeRaw when needed).
+    /// Lazy typed field pull: point view + one field, no decode, no JSON
+    /// document. Scalars cross as JSON values; missing/wrong-type reads
+    /// null. BlobLink fields surface their placeholder (resolve the doc
+    /// via DecodeRaw when needed).
     ViewGetField {
         collection: String,
         doc_id: String,
         field: String,
     },
     /// Decode one raw row back into a Document (blobs inflated). The bytes
-    /// must be an exact stored row (e.g. from QueryRaw) G�� never hand-built.
+    /// must be an exact stored row (e.g. from QueryRaw) — never hand-built.
     DecodeRaw {
         collection: String,
         doc_id: String,
@@ -158,7 +179,7 @@ pub enum HakoOp {
 }
 
 /// One raw row over the bridge: id in the clear, storage bytes as
-/// msgpack bin. Bytes are opaque G�� decode server-side via DecodeRaw.
+/// msgpack bin. Bytes are opaque: decode server-side via DecodeRaw.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawRow {
     pub id: String,
@@ -178,13 +199,12 @@ pub enum HakoResponse {
     /// Index readiness probe.
     Ready { ready: bool },
     AggregateResult { value: f64 },
-    Aggregate(f64), 
     SubscriptionAck { listener_id: String },
     Unsubscribed { listener_id: String },
     Collections { names: Vec<String> },
     Stats { details: serde_json::Value },
     Indexes { list: serde_json::Value },
-    AuditLog { entries: Vec<hakodb::engine::AuditEntry> },
+    AuditLog { entries: Vec<AuditEntry> },
     BulkActionResult { count: usize },
 }
 
@@ -210,7 +230,7 @@ pub struct BatchInput {
     pub collection: String,
     pub doc_id: String,
     pub data: Option<serde_json::Value>,
-    // Local-only scope for Delete items (Set/Patch ignore it).
+    /// Local-only scope for Delete items (Set/Patch ignore it).
     #[serde(default)]
     pub local_only: bool,
 }
@@ -237,20 +257,28 @@ pub struct CompositeFieldInput {
     pub desc: bool,
 }
 
+/// Shared handle the consumer manages with Tauri (`app.manage(...)`) and
+/// every command below borrows via `State`. `db` is public so out-of-tree
+/// crates (sync commands, admin tools) can reuse the same engine handle.
 #[derive(Clone)]
 pub struct HakoGateway {
     pub db: Arc<Hako>,
     subscriptions: Arc<Mutex<HashMap<String, SubscriptionEntry>>>,
 }
 
+/// What changed for one document inside a subscription delta.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeltaKind {
-    Full,    // Initial bootstrap
-    Update,  // Add or Modify
-    Delete,  // Removed or no longer matches filter
+    /// Initial bootstrap snapshot.
+    Full,
+    /// Added or modified (and still matches the query).
+    Update,
+    /// Removed, or updated so it no longer matches the query.
+    Delete,
 }
 
+/// One document change inside a [`DeltaPayload`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DocumentChange {
     pub kind: DeltaKind,
@@ -258,10 +286,13 @@ pub struct DocumentChange {
     pub data: Option<serde_json::Value>,
 }
 
+/// The batch container emitted per subscription event: every change since
+/// the last emit. The frontend merges these into its local cache
+/// (see `onSnapshot` in `@hakodb/tauri`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeltaPayload {
     pub listener_id: String,
-    pub changes: Vec<DocumentChange>, // The batch container
+    pub changes: Vec<DocumentChange>,
 }
 
 struct SubscriptionEntry {
@@ -277,21 +308,20 @@ impl HakoGateway {
         }
     }
 
-    // --- ADD THIS METHOD ---
+    /// Drops every subscription owned by a closed window. Call it from the
+    /// window's destroy hook so dead listeners stop waking the event loop.
     pub fn cleanup_window_subscriptions(&self, window_label: &str) {
         let mut subs = self.subscriptions.lock();
-        
-        // Find all listener IDs belonging to the closed window
+
         let ids_to_remove: Vec<String> = subs
             .iter()
             .filter(|(_, entry)| entry.window_label == window_label)
             .map(|(id, _)| id.clone())
             .collect();
 
-        // Stop the threads and remove from the map
         for id in ids_to_remove {
             if let Some(entry) = subs.remove(&id) {
-                // Sending this signal causes the loop in the thread to break
+                // The loop below breaks on this signal.
                 let _ = entry.stop_tx.send(());
             }
         }
@@ -303,6 +333,11 @@ impl HakoGateway {
         }
     }
 
+    /// Starts (or replaces) a live query: sends one `Full` bootstrap with
+    /// the current rows, then streams `Update`/`Delete` deltas as storage
+    /// events arrive. Matching runs on raw bytes without decoding
+    /// (`plan_for_watch` + `matches_watch`), so the hot path only decodes
+    /// rows that actually match.
     fn register_subscription<R: Runtime>(
         &self,
         window: Window<R>,
@@ -326,7 +361,7 @@ impl HakoGateway {
         let subscriptions = Arc::clone(&self.subscriptions);
         
         tokio::task::spawn_blocking(move || {
-            // --- 1. INITIAL BOOTSTRAP (The "Full" Snapshot) ---
+            // 1. Bootstrap: the current rows as one `Full` change.
             let initial_rows = match execute_query_input(&db, &query_template) {
                 Ok(rows) => rows,
                 Err(_) => Vec::new(),
@@ -341,22 +376,20 @@ impl HakoGateway {
                 }],
             };
 
-            // CRITICAL: Must convert to binary before emitting!
+            // Events must cross as MessagePack bytes, like `hako_exec`.
             if let Ok(bin) = to_binary_payload(&bootstrap_payload) {
                 let _ = window.emit(&ename, bin);
             }
-            
-            // --- 2. PREPARE MATCHER PLAN FOR LIVE UPDATES ---
-            // (via the public watch API — same plan, zero-decode match.)
+
+            // 2. Prebuild the filter plan once; every live event reuses it.
             let query_obj = build_query_from_input(&query_template).unwrap_or_else(|_| {
-                hakodb::query::query::Query::new(&query_template.collection)
+                Query::new(&query_template.collection)
             });
 
             let filter_plan = db.plan_for_watch(&query_obj);
 
-            // --- 3. EVENT LOOP ---
+            // 3. Event loop: drain pending events, emit one payload.
             loop {
-                // Check if unsubscribed
                 if stop_rx.try_recv().is_ok() { break; }
 
                 match rx.recv_timeout(Duration::from_millis(500)) {
@@ -366,36 +399,37 @@ impl HakoGateway {
 
                         let mut changes = Vec::new();
                         for event in events {
-                            let doc_id: String = event.path.to_string(); // The path is the ID in Hako
-                            
-                            // ID Filtering (Optimization: check before reading disk)
-                            if let Some(ref target_id) = query_template.doc_id_filter {
-                                if target_id.as_str() != &doc_id[..] { continue; }
+                            // In Hako the storage path is the doc id.
+                            let doc_id: String = event.path.to_string();
+
+                            // Cheap pre-filter before touching disk.
+                            if let Some(want) = query_template.doc_id_filter.as_deref() {
+                                if want != doc_id { continue; }
                             }
 
                             match event.kind {
-                                hakodb::engine::ChangeKind::Delete => {
-                                    // Provide a timestamp for the delete so client can ignore stale updates
+                                ChangeKind::Delete => {
+                                    // Deletes carry a timestamp so the client
+                                    // can ignore stale updates (LWW).
                                     let mut meta = serde_json::Map::new();
-                                    meta.insert("_time".to_string(), serde_json::json!(hakodb::util::clock::unix_millis() * 1000));
-                                    
-                                    changes.push(DocumentChange { 
-                                        kind: DeltaKind::Delete, 
-                                        doc_id, 
-                                        data: Some(serde_json::Value::Object(meta)) 
+                                    meta.insert("_time".to_string(), serde_json::json!(unix_millis() * 1000));
+
+                                    changes.push(DocumentChange {
+                                        kind: DeltaKind::Delete,
+                                        doc_id,
+                                        data: Some(serde_json::Value::Object(meta))
                                     });
                                 }
-                                hakodb::engine::ChangeKind::Put => {
-                                    // Raw bytes via the public watch API (no
-                                    // decoded point-get on the hot path).
+                                ChangeKind::Put => {
+                                    // Raw bytes, no decoded point-get.
                                     let bytes_res = db.get_raw_bytes(&query_template.collection, &event.path);
 
                                     if let Ok(Some(bytes)) = bytes_res {
-                                        // Complex Query Filtering (zero-decode
-                                        // view match — same cost as in-tree).
+                                        // Zero-decode match, same cost as in-tree.
+                                        // Row-header timestamp at bytes 2..10
+                                        // (mirrors the storage layout).
                                         let doc_time = i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8]));
-                                        if hakodb::engine::Hako::matches_watch(&doc_id, &bytes, &filter_plan) {
-                                            // Handle Projection
+                                        if Hako::matches_watch(&doc_id, &bytes, &filter_plan) {
                                             let doc = if let Some(ref p) = query_template.projection {
                                                 HakoDoc::decode_projected(&bytes, p)
                                             } else {
@@ -404,21 +438,21 @@ impl HakoGateway {
 
                                             if let Some(mut d) = doc {
                                                 let _ = db.resolve_document_blobs(&mut d, &query_template.collection);
-                                                changes.push(DocumentChange { 
-                                                    kind: DeltaKind::Update, 
-                                                    doc_id: doc_id.to_string(), 
-                                                    data: doc_to_json_value(&doc_id,&d).ok() 
+                                                changes.push(DocumentChange {
+                                                    kind: DeltaKind::Update,
+                                                    doc_id: doc_id.to_string(),
+                                                    data: doc_to_json_value(&doc_id,&d).ok()
                                                 });
                                             }
                                         } else {
-                                            // This handles the "Exit" case: 
-                                            // Doc existed and matched, but was updated to no longer match.
+                                            // Exit case: the doc matched before
+                                            // but the update moved it out.
                                             let mut meta = serde_json::Map::new();
                                             meta.insert("_time".to_string(), serde_json::json!(doc_time));
-                                            changes.push(DocumentChange { 
-                                                kind: DeltaKind::Delete, 
-                                                doc_id: doc_id.to_string(), 
-                                                data: Some(serde_json::Value::Object(meta)) 
+                                            changes.push(DocumentChange {
+                                                kind: DeltaKind::Delete,
+                                                doc_id: doc_id.to_string(),
+                                                data: Some(serde_json::Value::Object(meta))
                                             });
                                         }
                                     }
@@ -444,8 +478,11 @@ impl HakoGateway {
     }
 }
 
+/// The decoded shape of a `query` / `query_raw` / `subscribe` payload:
+/// everything `build_query_from_input` needs, without the action tag.
 #[derive(Debug, Clone)]
-struct QueryInput {    collection: String,
+struct QueryInput {
+    collection: String,
     filters: Vec<FilterInput>,
     or_groups: Option<Vec<Vec<FilterInput>>>,
     order_by: Option<Vec<OrderByInput>>,
@@ -461,6 +498,8 @@ struct QueryInput {    collection: String,
     local_only: bool,
 }
 
+/// What a `query` op does besides fetching: bulk delete or bulk patch over
+/// the same filter set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryAction {
@@ -469,6 +508,13 @@ pub enum QueryAction {
     Patch { data: serde_json::Value },
 }
 
+/// The one Tauri command. Every op runs on a blocking worker (the engine
+/// is synchronous) and the [`HakoResponse`] is returned as MessagePack
+/// bytes. Register the module path, not the root re-export:
+///
+/// ```ignore
+/// tauri::generate_handler![hakotauri::gateway::hako_exec]
+/// ```
 #[command]
 pub async fn hako_exec<R: Runtime>(
     _window: Window<R>,
@@ -477,8 +523,6 @@ pub async fn hako_exec<R: Runtime>(
 ) -> Result<Vec<u8>, String> {
     let gateway = state.inner().clone();
 
-    // 1. We wrap the logic in spawn_blocking. 
-    // The closure return type is Result<HakoResponse, String>
     let res = tokio::task::spawn_blocking(move || -> Result<HakoResponse, String> {
         match op {
             HakoOp::Get { collection, doc_id } => {
@@ -488,8 +532,8 @@ pub async fn hako_exec<R: Runtime>(
             }
             HakoOp::Set { collection, doc_id, data } => {
                 let doc = json_to_doc(&data)?;
-                // ponytail: `doc` is freshly built from JSON G�� move it in
-                // instead of deep-cloning every field via `put`.
+                // `doc` is freshly built from JSON — move it in instead of
+                // deep-cloning every field via `put`.
                 gateway.db.put_owned(&collection, &doc_id, doc).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
             }
@@ -551,8 +595,8 @@ pub async fn hako_exec<R: Runtime>(
                 }
             }
             HakoOp::QueryRaw { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, start_at, start_after, end_at, end_before } => {
-                // ponytail: same builder as Query (raw forced inside
-                // query_raw), defaults for the non-raw knobs.
+                // Same builder as Query; raw mode is forced inside
+                // `query_raw`. Projection/defer/local-only don't apply.
                 let input = QueryInput {
                     collection, doc_id_filter, filters, or_groups, order_by, limit, offset,
                     projection: None, start_at, start_after, end_at, end_before,
@@ -572,8 +616,8 @@ pub async fn hako_exec<R: Runtime>(
                 Ok(HakoResponse::Document { data: Some(data) })
             }
             HakoOp::ViewGetField { collection, doc_id, field } => {
-                // ponytail: stateless lazy pull G�� view borrowed, one field
-                // decoded, nothing owned except the JSON value itself.
+                // Stateless lazy pull — view borrowed, one field decoded,
+                // nothing owned except the JSON value itself.
                 let value = match gateway.db.get_view(&collection, &doc_id).map_err(|e| e.to_string())? {
                     Some(view) => view.get(&field).map(|v| v.to_json()),
                     None => None,
@@ -582,10 +626,9 @@ pub async fn hako_exec<R: Runtime>(
             }
             HakoOp::Batch { mutations } => {
                 let mut batch = Vec::with_capacity(mutations.len());
-                // ponytail: local-only deletes bypass the shared batch so
-                // their marks persist once per collection, not per item.
-                let mut local_dels: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
+                // Local-only deletes bypass the shared batch so their marks
+                // persist once per collection, not per item.
+                let mut local_dels: HashMap<String, Vec<String>> = HashMap::new();
                 for item in mutations {
                     match item.mutation {
                         BatchMutationKind::Set => {
@@ -617,19 +660,18 @@ pub async fn hako_exec<R: Runtime>(
                 }
                 if let Some(groups) = or_groups {
                     for group in groups {
-                        let filters: Vec<hakodb::query::filter::Filter> = group.iter()
-                            .map(|f: &FilterInput| -> Result<hakodb::query::filter::Filter, String> { 
-                                Ok(hakodb::query::filter::Filter { 
-                                    field: f.field.clone(), 
-                                    op: map_operator(&f.op), 
-                                    value: json_value_to_value(&f.value)? 
+                        let filters: Vec<Filter> = group.iter()
+                            .map(|f: &FilterInput| -> Result<Filter, String> {
+                                Ok(Filter {
+                                    field: f.field.clone(),
+                                    op: map_operator(&f.op),
+                                    value: json_value_to_value(&f.value)?
                                 })
                             })
                             .collect::<Result<Vec<_>, String>>()?;
                         query.or_groups.push(filters);
                     }
                 }
-                use hakodb::query::query::AggregateOp;
                 query = match kind {
                     AggregateKind::Count => query.aggregate(AggregateOp::Count),
                     AggregateKind::Sum => query.aggregate(AggregateOp::Sum(field.ok_or("missing field")?)),
@@ -644,8 +686,7 @@ pub async fn hako_exec<R: Runtime>(
                     _window,
                     listener_id.clone(),
                     QueryInput { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs: false, local_only: false },
-                    event_name.unwrap_or_else(||
-                    "hako://snapshot".to_string()),
+                    event_name.unwrap_or_else(|| "hako://snapshot".to_string()),
                 )?;
                 Ok(HakoResponse::SubscriptionAck { listener_id })
             }
@@ -685,7 +726,6 @@ pub async fn hako_exec<R: Runtime>(
                 Ok(HakoResponse::AuditLog { entries })
             }
             HakoOp::SetDurability { mode } => {
-                use hakodb::config::DurabilityMode;
                 let d_mode = match mode {
                     1 => DurabilityMode::Interval,
                     2 => DurabilityMode::Manual,
@@ -696,52 +736,48 @@ pub async fn hako_exec<R: Runtime>(
                 Ok(HakoResponse::Ok)
             }
             HakoOp::SetCompression { enabled: _, level: _ } => {
+                // No-op: compression is engine-managed in current versions.
                 Ok(HakoResponse::Ok)
             }
         }
     })
     .await
-    .map_err(|e| e.to_string())??; // First '?' handles spawn_blocking error, second handles inner String error
-
-    // 2. We now have 'res' as HakoResponse. Serialize it to MessagePack.
-    // rmp_serde::to_vec_named(&res).map_err(|e| format!("Serialization error: {}", e))
+    .map_err(|e| e.to_string())??; // Join error, then the op error.
     to_binary_payload(&res)
 }
 
 
+/// Builds an engine [`Query`] from a decoded [`QueryInput`].
 fn build_query_from_input(input: &QueryInput) -> Result<Query, String> {
     let mut query = Query::new(&input.collection);
-    // ponytail: per-query blob deferral (list views skip image reads).
+    // Per-query blob deferral (list views skip blob-file reads).
     query.defer_blobs = input.defer_blobs;
 
-    // 1. CRITICAL FIX: Inject doc_id_filter into the Query filters.
-    // The TS client often sends this for single-document snapshots or targeted queries.
-    // If we don't add this here, targeted queries return the whole collection.
+    // A doc_id_filter narrows the whole query to one document; without it
+    // a targeted request would return the entire collection.
     if let Some(ref id) = input.doc_id_filter {
         if !id.is_empty() {
             query = query.where_filter("id", Operator::Eq, Value::String(id.clone()));
         }
     }
 
-    // 2. Add Standard Filters (This handles the 'in' operator values)
     for filter in &input.filters {
         let val = json_value_to_value(&filter.value)?;
         query = query.where_filter(
-            &filter.field, 
-            map_operator(&filter.op), 
+            &filter.field,
+            map_operator(&filter.op),
             val
         );
     }
 
-    // 2. Add OR groups
     if let Some(groups) = &input.or_groups {
         for group in groups {
-            let filters: Vec<hakodb::query::filter::Filter> = group.iter()
-                .map(|f: &FilterInput| -> Result<hakodb::query::filter::Filter, String> { 
-                    Ok(hakodb::query::filter::Filter { 
-                        field: f.field.clone(), 
-                        op: map_operator(&f.op), 
-                        value: json_value_to_value(&f.value)? 
+            let filters: Vec<Filter> = group.iter()
+                .map(|f: &FilterInput| -> Result<Filter, String> {
+                    Ok(Filter {
+                        field: f.field.clone(),
+                        op: map_operator(&f.op),
+                        value: json_value_to_value(&f.value)?
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -749,21 +785,17 @@ fn build_query_from_input(input: &QueryInput) -> Result<Query, String> {
         }
     }
 
-    // 3. Sorting and Pagination
-    // if let Some(order) = &input.order_by { query = query.order_by(&order.field, order.ascending); }
     if let Some(ref orders) = &input.order_by {
         for order in orders {
             query = query.order_by(&order.field, order.ascending);
         }
     }
-    
+
     if let Some(limit) = input.limit { query = query.limit(limit); }
     if let Some(offset) = input.offset { query = query.offset(offset); }
 
-    // 5. Select/Projection
     if let Some(proj) = &input.projection { query = query.select_fields(proj.clone()); }
 
-    // 4. Cursor support
     if let Some(v) = &input.start_at { query.start_at = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
     if let Some(v) = &input.start_after { query.start_after = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
     if let Some(v) = &input.end_at { query.end_at = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
@@ -773,31 +805,30 @@ fn build_query_from_input(input: &QueryInput) -> Result<Query, String> {
 }
 
 
+/// Runs a query and converts every row to JSON in parallel. With a
+/// projection this takes the zero-copy path (only projected fields leave
+/// storage); otherwise full documents are decoded and converted.
 fn execute_query_input(db: &Hako, input: &QueryInput) -> Result<Vec<serde_json::Value>, String> {
-    // USE THE NEW HELPER
     let query = build_query_from_input(input)?;
 
-    // 1. Parallel Zero-Copy Projection Path
     if let Some(projection) = &input.projection {
         if !projection.is_empty() {
             let rows = db.query_projected_zero_copy(query.clone(), projection).map_err(|e| e.to_string())?;
-            // Use rayon to parallelize JSON construction
-            use rayon::prelude::*;
             return Ok(rows.into_par_iter()
                 .map(|(id, fields)| projection_fields_to_json(&id, fields).unwrap_or(serde_json::Value::Null))
                 .collect());
         }
     }
 
-    // 2. Parallel Standard Query Path
     let rows = db.query(query).map_err(|e| e.to_string())?;
-    
-    use rayon::prelude::*;
+
     Ok(rows.into_par_iter()
         .map(|(id, doc)| doc_to_json_value(&id, &doc).unwrap_or(serde_json::Value::Null))
         .collect())
 }
 
+/// Frontend filter op to engine [`Operator`]. The TS side sends snake_case
+/// (see `symToOp`); unknown strings never reach here.
 fn map_operator(op: &FilterOperator) -> Operator {
     match op {
         FilterOperator::Eq => Operator::Eq,
@@ -817,6 +848,7 @@ fn map_operator(op: &FilterOperator) -> Operator {
     }
 }
 
+/// Request JSON object to a stored document (Set / Batch-Set).
 fn json_to_doc(v: &serde_json::Value) -> Result<HakoDoc, String> {
     let obj = v.as_object().ok_or("document must be object")?;
     let mut doc = HakoDoc::default();
@@ -826,6 +858,7 @@ fn json_to_doc(v: &serde_json::Value) -> Result<HakoDoc, String> {
     Ok(doc)
 }
 
+/// Request JSON object to patch pairs (Patch / Batch-Patch / Query-Patch).
 fn json_to_vec(v: &serde_json::Value) -> Result<Vec<(String, Value)>, String> {
     let obj = v.as_object().ok_or("updates must be object")?;
     let mut out = Vec::new();
@@ -835,20 +868,22 @@ fn json_to_vec(v: &serde_json::Value) -> Result<Vec<(String, Value)>, String> {
     Ok(out)
 }
 
+/// Request JSON value to an engine [`Value`] (filters, cursors, writes).
 fn json_value_to_value(v: &serde_json::Value) -> Result<Value, String> {
     Value::from_json(v.clone())
 }
 
+/// Converts a stored document to JSON, injecting the doc id (storage rows
+/// don't carry it, but every client expects an `"id"` field).
 fn doc_to_json_value(id: &str, doc: &HakoDoc) -> Result<serde_json::Value, String> {
-    // Ok(doc.to_json())
     let mut json = doc.to_json();
     if let Some(obj) = json.as_object_mut() {
-        // Force the ID into the JSON response
         obj.insert("id".to_string(), serde_json::Value::String(id.to_string()));
     }
     Ok(json)
 }
 
+/// Zero-copy projected row to JSON: only the requested fields plus `"id"`.
 fn projection_fields_to_json(id: &str, fields: Vec<(String, Value)>) -> Result<serde_json::Value, String> {
     let mut map = serde_json::Map::new();
     map.insert("id".to_string(), serde_json::Value::String(id.to_string()));
@@ -858,6 +893,10 @@ fn projection_fields_to_json(id: &str, fields: Vec<(String, Value)>) -> Result<s
     Ok(serde_json::Value::Object(map))
 }
 
+/// Engine [`Value`] back to JSON for the frontend. Three shapes need
+/// knowing: `Binary` crosses as a number array, references as
+/// `{"__ref__": "col/id"}`, and unresolved blobs as
+/// `{"__blob__": {offset, len}}` (decode the row when the bytes are needed).
 fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
     match v {
         Value::Null | Value::ServerTimestamp => Ok(serde_json::Value::Null),
@@ -865,9 +904,7 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
         Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
         Value::Float(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number).ok_or("invalid float".into()),
         Value::String(s) => Ok(serde_json::Value::String(s.clone())),
-        Value::Binary(bytes) => {
-            Ok(serde_json::json!(bytes)) 
-        }
+        Value::Binary(bytes) => Ok(serde_json::json!(bytes)),
         Value::Timestamp(micros) => Ok(serde_json::Value::Number((*micros).into())),
         Value::Reference { collection, doc_id } => {
             let mut map = serde_json::Map::new();
@@ -881,7 +918,6 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
             }
             Ok(serde_json::Value::Object(map))
         }
-        // ADD THIS ARM:
         Value::BlobLink { offset, len } => {
             let mut map = serde_json::Map::new();
             let mut meta = serde_json::Map::new();
