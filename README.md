@@ -11,7 +11,7 @@ for the `@hakodb/tauri` TypeScript client.
 
 | hakotauri | hako core | tauri |
 |---|---|---|
-| 0.2.1 | `hakodb 0.8.23+` (crates.io) | =2.10.3 (pinned triple, see below) |
+| 0.3.0 | `hakodb 0.8.23+` (crates.io) | 2.11 (see below) |
 
 ## Register
 
@@ -52,13 +52,16 @@ and match per-event bytes with zero decode
 (`Hako::matches_watch`) — the same cost as the former in-tree
 implementation; only the location moved.
 
-## Pinned triple
+## Tauri version
 
-`tauri =2.10.3` + `tauri-macros =2.5.5` + `tauri-runtime =2.10.1` — the
-exact set the in-tree gateway build was green on. Newer macros (2.6.x)
-emit a doubled `#[macro_export]` that current rustc rejects (E0255),
-and a newer runtime breaks tauri 2.10.3 (Send vs Send+Sync drift).
-Do not bump one without rebuilding against all three.
+`tauri 2.11` + `tauri-macros 2.6` + `tauri-runtime 2.11` — the minor is
+unpinned on purpose so cargo unifies one tauri version across the SDK
+and the consumer binary (two tauri versions in one binary means
+incompatible `State`/`Window` types and unregistrable commands).
+History: 0.2.x pinned `=2.10.3/=2.5.5/=2.10.1` because macros 2.6.x
+emitted a doubled `#[macro_export]` (E0255) against tauri 2.10.3; that
+combination no longer exists on the 2.11 line (verified green with
+macros 2.6.3 + runtime 2.11.3 — the kastoko app line).
 
 ## Build
 

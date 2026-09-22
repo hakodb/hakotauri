@@ -1,6 +1,6 @@
 //! Tauri gateway commands for the HakoDB embedded document engine.
 //!
-//! The command itself lives in [`gateway`] (a submodule on purpose: the
+//! The command itself lives in the `gateway` module (a submodule on purpose: the
 //! `#[command]` macro emits a same-named helper macro that collides at the
 //! crate root on current rustc — see the submodule note there). Re-exported
 //! here for ergonomics, but register the **module path** with Tauri:

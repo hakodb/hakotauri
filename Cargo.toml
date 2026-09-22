@@ -1,6 +1,6 @@
 [package]
 name = "hakotauri"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Tauri gateway commands for the HakoDB embedded document engine"
 license = "MIT"
@@ -13,13 +13,13 @@ path = "src/lib.rs"
 # Sync features on: the net_sync/cloud_sync command modules drive them, so
 # consumers register SDK commands instead of using hakodb directly.
 hakodb = { version = "0.8.23", default-features = false, features = ["net-sync", "cloud-sync"] }
-tauri = { version = "=2.10.3" }
-# Pinned as a triple: the in-tree gateway build was green on exactly
-# tauri 2.10.3 + macros 2.5.5 + runtime 2.10.1. Newer macros (2.6.x)
-# emit a doubled #[macro_export] that rustc rejects with E0255, and a
-# newer runtime breaks tauri 2.10.3 (Send vs Send+Sync drift).
-tauri-macros = { version = "=2.5.5" }
-tauri-runtime = { version = "=2.10.1" }
+tauri = { version = "2.11" }
+# Formerly pinned as a triple (=2.10.3/=2.5.5/=2.10.1) because macros 2.6.x
+# emitted a doubled #[macro_export] (E0255) against tauri 2.10.3. Re-test
+# before re-pinning: match the consumer line (kastoko: tauri 2.11.5,
+# macros 2.6.3, runtime 2.11.3) so one tauri version serves the binary.
+tauri-macros = { version = "2.6" }
+tauri-runtime = { version = "2.11" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 rayon = "1.8"
 serde = { version = "1", features = ["derive"] }

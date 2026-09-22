@@ -104,7 +104,7 @@ pub enum HakoOp {
     /// Raw scan: pinned storage bytes per row, no decode, no JSON. Bytes
     /// cross msgpack as bin (Uint8Array on the TS side) and stay opaque
     /// there: hash/count/export them, or send selected rows back through
-    /// DecodeRaw. Page with start_after: [lastId] under an id order; ids
+    /// DecodeRaw. Page with start_after: `[lastId]` under an id order; ids
     /// ride along in the clear.
     QueryRaw {
         collection: String,
