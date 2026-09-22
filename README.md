@@ -1,5 +1,7 @@
 # hakotauri
 
+> Part of [**HakoDB**](https://github.com/hakodb/hakodb) — embedded Firestore-style document DB in Rust. The engine + C ABI live in `hakodb/hakodb`; this repo holds the Tauri gateway crate (pairs with [`hakotaurits`](https://github.com/hakodb/hakotaurits)).
+
 Tauri gateway commands for
 HakoDB: exposes the engine
 (get/set/query/watch/index admin) as binary (MessagePack) Tauri commands
