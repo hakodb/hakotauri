@@ -9,15 +9,32 @@ for the `@hakodb/tauri` TypeScript client.
 
 | hakotauri | hako core | tauri |
 |---|---|---|
-| 0.1.1 | `cloud_sync` branch / `v0.8.21`+ release asset | =2.10.3 (pinned triple, see below) |
+| 0.2.0 | `cloud_sync` branch / `v0.8.21`+ release asset | =2.10.3 (pinned triple, see below) |
 
 ## Register
 
 ```rust
 tauri::Builder::default()
     .manage(hakotauri::HakoGateway::new(db))
+    .manage(hakotauri::net_sync::NetSyncState::new(app_handle.clone()))
+    .manage(hakotauri::cloud_sync::CloudSyncState::new(app_handle.clone()))
     .invoke_handler(tauri::generate_handler![
-        hakotauri::gateway::hako_exec
+        hakotauri::gateway::hako_exec,
+        hakotauri::net_sync::toggle_net_sync,
+        hakotauri::net_sync::get_sync_status,
+        hakotauri::net_sync::list_network_peers,
+        hakotauri::net_sync::prepare_sync_restore,
+        hakotauri::net_sync::bootstrap_sync,
+        hakotauri::cloud_sync::toggle_cloud_sync,
+        hakotauri::cloud_sync::get_cloud_sync_status,
+        hakotauri::cloud_sync::get_cloud_peers,
+        hakotauri::cloud_sync::get_cloud_config,
+        hakotauri::cloud_sync::cloud_group_get,
+        hakotauri::cloud_sync::cloud_group_new_key,
+        hakotauri::cloud_sync::cloud_group_set,
+        hakotauri::cloud_sync::cloud_group_add_member,
+        hakotauri::cloud_sync::cloud_group_remove_member,
+        hakotauri::cloud_sync::bootstrap_cloud_sync,
     ])
 ```
 
