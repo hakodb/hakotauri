@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 # Sync features on: the net_sync/cloud_sync command modules drive them, so
 # consumers register SDK commands instead of using hakodb directly.
-hakodb = { git = "https://github.com/hakodb/hakodb.git", branch = "cloud_sync", default-features = false, features = ["net-sync", "cloud-sync"] }
+hakodb = { version = "0.8.23", default-features = false, features = ["net-sync", "cloud-sync"] }
 tauri = { version = "=2.10.3" }
 # Pinned as a triple: the in-tree gateway build was green on exactly
 # tauri 2.10.3 + macros 2.5.5 + runtime 2.10.1. Newer macros (2.6.x)
