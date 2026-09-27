@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 # Sync features on: the net_sync/cloud_sync command modules drive them, so
 # consumers register SDK commands instead of using hakodb directly.
-hakodb = { version = "0.8.23", default-features = false, features = ["net-sync", "cloud-sync"] }
+hakodb = { version = "0.8.29", default-features = false, features = ["net-sync", "cloud-sync"] }
 tauri = { version = "2.11" }
 # Formerly pinned as a triple (=2.10.3/=2.5.5/=2.10.1) because macros 2.6.x
 # emitted a doubled #[macro_export] (E0255) against tauri 2.10.3. Re-test
