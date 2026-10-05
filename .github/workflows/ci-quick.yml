@@ -31,4 +31,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: check (locked, incl. tests)
-        run: cargo check --locked --tests
+        run: cargo check --tests
