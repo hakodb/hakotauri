@@ -1,0 +1,34 @@
+# Quick gate for branch protection (required check on main).
+# Tauri needs system webkit libs even for check (standard Tauri Linux
+# set); the check itself is compile-only (locked), no bundling.
+
+name: ci-quick
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: quick-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tauri system deps
+        run: >
+          sudo apt-get update -qq &&
+          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev
+          libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check (locked, incl. tests)
+        run: cargo check --tests
