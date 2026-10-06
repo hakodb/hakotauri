@@ -176,6 +176,7 @@ pub enum HakoOp {
     GetAuditLog,
     SetDurability { mode: i32 },
     SetCompression { enabled: bool, level: i32 },
+    SetGroupCommitInterval { ms: u64 },
 }
 
 /// One raw row over the bridge: id in the clear, storage bytes as
@@ -739,6 +740,10 @@ pub async fn hako_exec<R: Runtime>(
                 // No-op: compression is engine-managed in current versions.
                 Ok(HakoResponse::Ok)
             }
+            HakoOp::SetGroupCommitInterval { ms } => {
+                gateway.db.set_group_commit_interval_ms_all(ms);
+                Ok(HakoResponse::Ok)
+            }
         }
     })
     .await
@@ -967,6 +972,18 @@ mod casing_tests {
         .expect("delete must parse");
         match del {
             HakoOp::Delete { local_only, .. } => assert!(local_only),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn set_group_commit_interval_wire_shape() {
+        // tag + snake_case field, matching the TS wrapper's payload.
+        let op: HakoOp =
+            serde_json::from_str(r#"{"op":"set_group_commit_interval","ms":50}"#)
+                .expect("must parse");
+        match op {
+            HakoOp::SetGroupCommitInterval { ms } => assert_eq!(ms, 50),
             _ => panic!("wrong variant"),
         }
     }
