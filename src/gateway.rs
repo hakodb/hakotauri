@@ -177,6 +177,16 @@ pub enum HakoOp {
     SetDurability { mode: i32 },
     SetCompression { enabled: bool, level: i32 },
     SetGroupCommitInterval { ms: u64 },
+    /// Move docs between collections (archive/restore): timestamp-
+    /// preserving put at dst first, fresh tombstone at src. Returns
+    /// moved ids + ids missing at src; refuses excluded sides.
+    RelocateDocs { src: String, dst: String, ids: Vec<String> },
+    /// Explicit load of one (usually lazy archive) collection.
+    LoadCollection { collection: String },
+    /// Explicit evict of one lazy collection (refuses non-lazy).
+    UnloadCollection { collection: String },
+    /// Archive-group collections on disk but not loaded.
+    UnloadedCollections,
 }
 
 /// One raw row over the bridge: id in the clear, storage bytes as
@@ -207,6 +217,8 @@ pub enum HakoResponse {
     Indexes { list: serde_json::Value },
     AuditLog { entries: Vec<AuditEntry> },
     BulkActionResult { count: usize },
+    /// Relocate report: moved ids + ids missing at source.
+    RelocateResult { moved: Vec<String>, missing: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -744,6 +756,21 @@ pub async fn hako_exec<R: Runtime>(
                 gateway.db.set_group_commit_interval_ms_all(ms);
                 Ok(HakoResponse::Ok)
             }
+            HakoOp::RelocateDocs { src, dst, ids } => {
+                let rep = gateway.db.relocate_docs(&src, &dst, &ids).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::RelocateResult { moved: rep.moved, missing: rep.missing })
+            }
+            HakoOp::LoadCollection { collection } => {
+                gateway.db.load_collection(&collection).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::UnloadCollection { collection } => {
+                gateway.db.unload_collection(&collection).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::UnloadedCollections => {
+                Ok(HakoResponse::Collections { names: gateway.db.unloaded_lazy_collections() })
+            }
         }
     })
     .await
@@ -986,5 +1013,29 @@ mod casing_tests {
             HakoOp::SetGroupCommitInterval { ms } => assert_eq!(ms, 50),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn relocate_wire_shapes() {
+        let op: HakoOp =
+            serde_json::from_str(r#"{"op":"relocate_docs","src":"a","dst":"b","ids":["k1"]}"#)
+                .expect("must parse");
+        match op {
+            HakoOp::RelocateDocs { src, dst, ids } => {
+                assert_eq!(src, "a");
+                assert_eq!(dst, "b");
+                assert_eq!(ids, vec!["k1".to_string()]);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let op: HakoOp = serde_json::from_str(r#"{"op":"load_collection","collection":"a"}"#)
+            .expect("must parse");
+        assert!(matches!(op, HakoOp::LoadCollection { .. }));
+        let op: HakoOp = serde_json::from_str(r#"{"op":"unload_collection","collection":"a"}"#)
+            .expect("must parse");
+        assert!(matches!(op, HakoOp::UnloadCollection { .. }));
+        let op: HakoOp = serde_json::from_str(r#"{"op":"unloaded_collections"}"#)
+            .expect("must parse");
+        assert!(matches!(op, HakoOp::UnloadedCollections));
     }
 }
