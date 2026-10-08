@@ -12,6 +12,7 @@ for the `@hakodb/tauri` TypeScript client.
 | hakotauri | hako core | tauri |
 |---|---|---|
 | 0.3.0 | `hakodb 0.8.23+` (crates.io) | 2.11 (see below) |
+| 0.4.2 | `hakodb 0.12.2` (archive: relocate/load/unload wired to ops) | 2.11 (see below) |
 
 ## Register
 
