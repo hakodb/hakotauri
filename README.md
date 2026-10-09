@@ -13,6 +13,7 @@ for the `@hakodb/tauri` TypeScript client.
 |---|---|---|
 | 0.3.0 | `hakodb 0.8.23+` (crates.io) | 2.11 (see below) |
 | 0.4.2 | `hakodb 0.12.2` (archive: relocate/load/unload wired to ops) | 2.11 (see below) |
+| 0.4.3 | `hakodb 0.12.4` (WAL reserve ratchet fix; Interval files follow data size) | 2.11 (see below) |
 
 ## Register
 
