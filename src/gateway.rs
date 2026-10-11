@@ -44,6 +44,7 @@ use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::{AuditEntry, BatchMutation, ChangeKind, Hako};
 use hakodb::index::composite::definition::SortDirection;
+use hakodb::index::vector::{decode_f32s, distance, Metric};
 use hakodb::query::filter::{Filter, Operator};
 use hakodb::query::query::{AggregateOp, Query};
 use hakodb::util::clock::unix_millis;
@@ -77,6 +78,22 @@ pub enum HakoOp {
     CreateIndex { collection: String, field: String },
     CreateFtsIndex { collection: String, field: String },
     CreateCompositeIndex { collection: String, fields: Vec<CompositeFieldInput> },
+    CreateVectorIndex {
+        collection: String,
+        field: String,
+        dim: u32,
+        /// Omitted by old clients -> cosine (the RAG default).
+        #[serde(default)]
+        metric: VectorMetric,
+    },
+    FindNear {
+        collection: String,
+        field: String,
+        query: Vec<f32>,
+        /// Omitted by old clients -> 10.
+        #[serde(default = "default_near_k")]
+        k: usize,
+    },
     Query {
         collection: String,
         #[serde(default)]
@@ -219,6 +236,42 @@ pub enum HakoResponse {
     BulkActionResult { count: usize },
     /// Relocate report: moved ids + ids missing at source.
     RelocateResult { moved: Vec<String>, missing: Vec<String> },
+    /// KNN hits: nearest-first, exact score per hit (same `distance()` the
+    /// executor rescore uses — the graph only prunes, never orders).
+    NearResult { hits: Vec<NearHit> },
+}
+
+/// One KNN hit: doc id, exact metric distance, and the doc itself (with
+/// `"id"` injected, like every other row shape).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NearHit {
+    pub id: String,
+    pub score: f64,
+    pub doc: serde_json::Value,
+}
+
+/// Wire metric for vector indexes. Serializes as `"cosine"` / `"l2"`
+/// (matches `Metric::from_u32`: 0 = cosine, 1 = l2 on the FFI side).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorMetric {
+    #[default]
+    Cosine,
+    L2,
+}
+
+impl VectorMetric {
+    fn metric(self) -> Metric {
+        match self {
+            VectorMetric::Cosine => Metric::Cosine,
+            VectorMetric::L2 => Metric::L2,
+        }
+    }
+}
+
+fn default_near_k() -> usize {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -580,6 +633,32 @@ pub async fn hako_exec<R: Runtime>(
                 let _ = gateway.db.create_composite_index(&collection, parsed_fields);
                 gateway.db.persist_index_defs().map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
+            }
+            HakoOp::CreateVectorIndex { collection, field, dim, metric } => {
+                gateway.db.create_vector_index(&collection, &field, dim, metric.metric()).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::FindNear { collection, field, query, k } => {
+                // The pipeline drops scores, so recompute the exact metric
+                // distance per hit from the stored document vector — twin of
+                // `hk_engine_find_near` in hakodb's ffi.rs (kept inline: one
+                // shared helper would couple this crate's release train to
+                // core's; promote it if a third consumer appears).
+                let metric = gateway.db.vector_metric(&collection, &field).unwrap_or(Metric::Cosine);
+                let rows = gateway.db.find_near(&collection, &field, &query, k).map_err(|e| e.to_string())?;
+                let mut hits = Vec::with_capacity(rows.len());
+                for (id, doc) in &rows {
+                    let score = match doc.get(&field) {
+                        Some(Value::Binary(b)) => decode_f32s(b)
+                            .ok()
+                            .filter(|v| v.len() == query.len())
+                            .map(|v| distance(metric, &query, &v))
+                            .unwrap_or(f64::INFINITY),
+                        _ => f64::INFINITY,
+                    };
+                    hits.push(NearHit { id: id.clone(), score, doc: doc_to_json_value(id, doc)? });
+                }
+                Ok(HakoResponse::NearResult { hits })
             }
             HakoOp::Query { collection, action, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs, local_only } => {
                 let input = QueryInput { 
@@ -1037,5 +1116,40 @@ mod casing_tests {
         let op: HakoOp = serde_json::from_str(r#"{"op":"unloaded_collections"}"#)
             .expect("must parse");
         assert!(matches!(op, HakoOp::UnloadedCollections));
+    }
+
+    #[test]
+    fn vector_wire_shapes() {
+        // Metric omittable -> cosine; k omittable -> 10 (old clients).
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"create_vector_index","collection":"docs","field":"emb","dim":384}"#,
+        )
+        .expect("must parse");
+        match op {
+            HakoOp::CreateVectorIndex { dim, metric, .. } => {
+                assert_eq!(dim, 384);
+                assert!(matches!(metric, VectorMetric::Cosine));
+            }
+            _ => panic!("wrong variant"),
+        }
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"create_vector_index","collection":"docs","field":"emb","dim":2,"metric":"l2"}"#,
+        )
+        .expect("must parse");
+        assert!(matches!(
+            op,
+            HakoOp::CreateVectorIndex { metric: VectorMetric::L2, .. }
+        ));
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"find_near","collection":"docs","field":"emb","query":[1.0,0.5]}"#,
+        )
+        .expect("must parse");
+        match op {
+            HakoOp::FindNear { k, query, .. } => {
+                assert_eq!(k, 10);
+                assert_eq!(query, vec![1.0, 0.5]);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
