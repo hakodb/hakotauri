@@ -183,6 +183,11 @@ pub enum HakoOp {
     Unsubscribe { listener_id: String },
     Backup { path: String },
     Compact,
+    /// Flush WAL + segments to disk (close path, deterministic tests).
+    Flush,
+    /// Doc ids in a collection (key scans for seeding, archive passes,
+    /// stats — no decode, no filters).
+    ListStorageKeys { collection: String },
     GetStats,
     /// True once background index recovery finishes. Poll after open
     /// before cursor-paged queries (pre-readiness plans ignore bounds).
@@ -230,6 +235,8 @@ pub enum HakoResponse {
     SubscriptionAck { listener_id: String },
     Unsubscribed { listener_id: String },
     Collections { names: Vec<String> },
+    /// Doc ids in a collection (ListStorageKeys).
+    StorageKeys { ids: Vec<String> },
     Stats { details: serde_json::Value },
     Indexes { list: serde_json::Value },
     AuditLog { entries: Vec<AuditEntry> },
@@ -801,6 +808,14 @@ pub async fn hako_exec<R: Runtime>(
                 gateway.db.compact().map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
             }
+            HakoOp::Flush => {
+                gateway.db.flush().map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::ListStorageKeys { collection } => {
+                let ids = gateway.db.list_storage_keys(&collection).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::StorageKeys { ids })
+            }
             HakoOp::Backup { path } => {
                 gateway.db.backup(path).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
@@ -1116,6 +1131,20 @@ mod casing_tests {
         let op: HakoOp = serde_json::from_str(r#"{"op":"unloaded_collections"}"#)
             .expect("must parse");
         assert!(matches!(op, HakoOp::UnloadedCollections));
+    }
+
+    #[test]
+    fn consumer_ops_wire_shapes() {
+        // Flush is a bare tag; ListStorageKeys carries the collection.
+        // Response side stays externally-tagged snake_case like the rest.
+        let op: HakoOp = serde_json::from_str(r#"{"op":"flush"}"#).expect("must parse");
+        assert!(matches!(op, HakoOp::Flush));
+        let op: HakoOp = serde_json::from_str(r#"{"op":"list_storage_keys","collection":"c"}"#)
+            .expect("must parse");
+        assert!(matches!(op, HakoOp::ListStorageKeys { .. }));
+        let res = HakoResponse::StorageKeys { ids: vec!["a".into()] };
+        let v = serde_json::to_value(&res).expect("serializes");
+        assert_eq!(v, serde_json::json!({"storage_keys": {"ids": ["a"]}}));
     }
 
     #[test]

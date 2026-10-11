@@ -15,6 +15,7 @@ for the `@hakodb/tauri` TypeScript client.
 | 0.4.2 | `hakodb 0.12.2` (archive: relocate/load/unload wired to ops) | 2.11 (see below) |
 | 0.4.3 | `hakodb 0.12.4` (WAL reserve ratchet fix; Interval files follow data size) | 2.11 (see below) |
 | 0.4.4 | `hakodb 0.13+` (vector: `create_vector_index` + `find_near`) | 2.11 (see below) |
+| 0.4.5 | `hakodb 0.13+` (consumer ops: `flush` + `list_storage_keys`) | 2.11 (see below) |
 
 ## Register
 
