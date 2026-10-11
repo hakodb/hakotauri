@@ -1,6 +1,6 @@
 [package]
 name = "hakotauri"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 description = "Tauri gateway commands for the HakoDB embedded document engine"
 license = "MIT"
@@ -8,6 +8,15 @@ license = "MIT"
 [lib]
 name = "hakotauri"
 path = "src/lib.rs"
+
+# Optional sync planes (default = today's set: net + cloud, never
+# socket-sync). Consumers pin explicitly
+# (`default-features = false, features = ["net-sync", "cloud-sync"]`)
+# to stay immune to future default changes.
+[features]
+default = ["net-sync", "cloud-sync"]
+net-sync = ["hakodb/net-sync"]
+cloud-sync = ["hakodb/cloud-sync"]
 
 [dependencies]
 # Sync features on: the net_sync/cloud_sync command modules drive them, so

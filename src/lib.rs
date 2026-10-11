@@ -17,11 +17,26 @@
 //! `hakodb::cloud_sync` directly.
 
 mod gateway;
+#[cfg(feature = "cloud-sync")]
 pub mod cloud_sync;
+#[cfg(feature = "net-sync")]
 pub mod net_sync;
 
 pub use gateway::{
     hako_exec, AggregateKind, BatchInput, BatchMutationKind, CompositeFieldInput,
     DeltaKind, DeltaPayload, DocumentChange, FilterInput, FilterOperator, HakoGateway,
     HakoOp, HakoResponse, OrderByInput, QueryAction, RawRow,
+};
+
+/// Engine types re-exported so consumers don't need a direct `hakodb`
+/// dependency for the in-process API (bootstrap `Hako::open`, backend-owned
+/// handle, tests). Versions unify through this crate's pin; features are
+/// chosen via `[features]` (default = net-sync + cloud-sync, never
+/// socket-sync unless asked).
+pub use hakodb::{
+    config::HakoConfig,
+    document::{hako_doc::HakoDoc, value::Value},
+    engine::{BatchMutation, Hako},
+    index::composite::definition::SortDirection,
+    query::{filter::Operator, query::Query},
 };
