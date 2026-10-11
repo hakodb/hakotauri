@@ -1,6 +1,6 @@
 [package]
 name = "hakotauri"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 description = "Tauri gateway commands for the HakoDB embedded document engine"
 license = "MIT"
@@ -17,6 +17,9 @@ path = "src/lib.rs"
 default = ["net-sync", "cloud-sync"]
 net-sync = ["hakodb/net-sync"]
 cloud-sync = ["hakodb/cloud-sync"]
+# Unix-socket peering for co-located instances (unix-only; silent absence
+# on Windows). Drive SocketSync directly over the shared engine handle.
+socket-sync = ["hakodb/socket-sync"]
 
 [dependencies]
 # Sync features on: the net_sync/cloud_sync command modules drive them, so

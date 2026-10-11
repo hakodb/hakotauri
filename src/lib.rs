@@ -34,9 +34,14 @@ pub use gateway::{
 /// chosen via `[features]` (default = net-sync + cloud-sync, never
 /// socket-sync unless asked).
 pub use hakodb::{
-    config::HakoConfig,
+    config::{DurabilityMode, HakoConfig},
     document::{hako_doc::HakoDoc, value::Value},
     engine::{BatchMutation, Hako},
+    error::HakoError,
     index::composite::definition::SortDirection,
     query::{filter::Operator, query::Query},
 };
+/// Unix-socket peering (opt-in via `socket-sync`; unix-only like the
+/// engine module — absent on Windows by design, not by omission).
+#[cfg(all(unix, feature = "socket-sync"))]
+pub use hakodb::socket_sync::SocketSync;
