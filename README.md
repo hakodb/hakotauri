@@ -18,6 +18,7 @@ for the `@hakodb/tauri` TypeScript client.
 | 0.4.5 | `hakodb 0.13+` (consumer ops: `flush` + `list_storage_keys`) | 2.11 (see below) |
 | 0.4.6 | `hakodb 0.13+` (facade: engine re-exports + optional `net-sync`/`cloud-sync` features) | 2.11 (see below) |
 | 0.4.7 | `hakodb 0.13+` (facade: `socket-sync` plane + `DurabilityMode`/`HakoError`/`SocketSync` re-exports) | 2.11 (see below) |
+| 0.4.8 | `hakodb 0.14+` (graph: `create_traverse_index` + `find_paths` BFS) | 2.11 (see below) |
 
 > Consumers don't need a direct `hakodb` dependency: `use hakotauri::{Hako,
 > HakoConfig, HakoDoc, Value, BatchMutation, SortDirection, Operator, Query}`.
