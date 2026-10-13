@@ -86,6 +86,24 @@ pub enum HakoOp {
         #[serde(default)]
         metric: VectorMetric,
     },
+    CreateTraverseIndex {
+        collection: String,
+    },
+    FindPaths {
+        collection: String,
+        doc_id: String,
+        /// Omitted by old clients -> outgoing.
+        #[serde(default)]
+        direction: TraverseDirection,
+        /// Omitted -> any ref field.
+        edge: Option<String>,
+        /// Omitted by old clients -> 10.
+        #[serde(default = "default_traverse_depth")]
+        max_depth: usize,
+        /// Omitted by old clients -> 100.
+        #[serde(default = "default_traverse_k")]
+        k: usize,
+    },
     FindNear {
         collection: String,
         field: String,
@@ -246,6 +264,20 @@ pub enum HakoResponse {
     /// KNN hits: nearest-first, exact score per hit (same `distance()` the
     /// executor rescore uses — the graph only prunes, never orders).
     NearResult { hits: Vec<NearHit> },
+    /// Graph BFS hits in walk order (collection + id: paths cross
+    /// collections; depth = hops from the anchor).
+    PathResult { hits: Vec<PathHit> },
+}
+
+/// One path hit: where it lives, its id, BFS depth, and the doc itself
+/// (with `"id"` injected, like every other row shape).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PathHit {
+    pub collection: String,
+    pub id: String,
+    pub depth: u64,
+    pub doc: serde_json::Value,
 }
 
 /// One KNN hit: doc id, exact metric distance, and the doc itself (with
@@ -279,6 +311,34 @@ impl VectorMetric {
 
 fn default_near_k() -> usize {
     10
+}
+
+/// Wire direction for graph BFS (mirrors engine TraverseDir).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TraverseDirection {
+    #[default]
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+impl TraverseDirection {
+    fn engine(self) -> hakodb::index::traverse::TraverseDir {
+        match self {
+            TraverseDirection::Outgoing => hakodb::index::traverse::TraverseDir::Outgoing,
+            TraverseDirection::Incoming => hakodb::index::traverse::TraverseDir::Incoming,
+            TraverseDirection::Both => hakodb::index::traverse::TraverseDir::Both,
+        }
+    }
+}
+
+fn default_traverse_depth() -> usize {
+    10
+}
+
+fn default_traverse_k() -> usize {
+    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,6 +704,29 @@ pub async fn hako_exec<R: Runtime>(
             HakoOp::CreateVectorIndex { collection, field, dim, metric } => {
                 gateway.db.create_vector_index(&collection, &field, dim, metric.metric()).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
+            }
+            HakoOp::CreateTraverseIndex { collection } => {
+                gateway.db.create_traverse_index(&collection).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::FindPaths { collection, doc_id, direction, edge, max_depth, k } => {
+                let spec = hakodb::index::traverse::TraverseSpec {
+                    direction: direction.engine(),
+                    edge_field: edge,
+                    max_depth,
+                    limit: k,
+                };
+                let rows = gateway.db.find_paths(&collection, &doc_id, &spec).map_err(|e| e.to_string())?;
+                let mut hits = Vec::with_capacity(rows.len());
+                for h in &rows {
+                    hits.push(PathHit {
+                        collection: h.collection.clone(),
+                        id: h.id.clone(),
+                        depth: h.depth as u64,
+                        doc: doc_to_json_value(&h.id, &h.doc)?,
+                    });
+                }
+                Ok(HakoResponse::PathResult { hits })
             }
             HakoOp::FindNear { collection, field, query, k } => {
                 // The pipeline drops scores, so recompute the exact metric
@@ -1145,6 +1228,37 @@ mod casing_tests {
         let res = HakoResponse::StorageKeys { ids: vec!["a".into()] };
         let v = serde_json::to_value(&res).expect("serializes");
         assert_eq!(v, serde_json::json!({"storage_keys": {"ids": ["a"]}}));
+    }
+
+    #[test]
+    fn graph_wire_shapes() {
+        // Direction omittable -> outgoing; depth/k omittable -> 10/100.
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"create_traverse_index","collection":"g"}"#,
+        )
+        .expect("must parse");
+        assert!(matches!(op, HakoOp::CreateTraverseIndex { .. }));
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"find_paths","collection":"g","doc_id":"a"}"#,
+        )
+        .expect("must parse");
+        match op {
+            HakoOp::FindPaths { direction, max_depth, k, edge, .. } => {
+                assert!(matches!(direction, TraverseDirection::Outgoing));
+                assert_eq!(max_depth, 10);
+                assert_eq!(k, 100);
+                assert_eq!(edge, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"find_paths","collection":"g","doc_id":"a","direction":"both","edge":"link","max_depth":3,"k":5}"#,
+        )
+        .expect("must parse");
+        assert!(matches!(
+            op,
+            HakoOp::FindPaths { direction: TraverseDirection::Both, .. }
+        ));
     }
 
     #[test]
