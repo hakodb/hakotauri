@@ -89,6 +89,10 @@ pub enum HakoOp {
     CreateTraverseIndex {
         collection: String,
     },
+    /// Phase B: register an edge collection (tracks + `_from`/`_to`).
+    CreateEdgeIndex {
+        collection: String,
+    },
     FindPaths {
         collection: String,
         doc_id: String,
@@ -103,6 +107,10 @@ pub enum HakoOp {
         /// Omitted by old clients -> 100.
         #[serde(default = "default_traverse_k")]
         k: usize,
+        /// Phase B: edge collection (docs with _from/_to join the walk).
+        via: Option<String>,
+        /// Phase B: numeric prop on edge docs for Dijkstra ordering.
+        weight: Option<String>,
     },
     FindNear {
         collection: String,
@@ -277,6 +285,7 @@ pub struct PathHit {
     pub collection: String,
     pub id: String,
     pub depth: u64,
+    pub cost: f64,
     pub doc: serde_json::Value,
 }
 
@@ -709,12 +718,14 @@ pub async fn hako_exec<R: Runtime>(
                 gateway.db.create_traverse_index(&collection).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
             }
-            HakoOp::FindPaths { collection, doc_id, direction, edge, max_depth, k } => {
+            HakoOp::FindPaths { collection, doc_id, direction, edge, max_depth, k, via, weight } => {
                 let spec = hakodb::index::traverse::TraverseSpec {
                     direction: direction.engine(),
                     edge_field: edge,
                     max_depth,
                     limit: k,
+                    via_edge: via,
+                    weight_field: weight,
                 };
                 let rows = gateway.db.find_paths(&collection, &doc_id, &spec).map_err(|e| e.to_string())?;
                 let mut hits = Vec::with_capacity(rows.len());
@@ -723,10 +734,15 @@ pub async fn hako_exec<R: Runtime>(
                         collection: h.collection.clone(),
                         id: h.id.clone(),
                         depth: h.depth as u64,
+                        cost: h.cost,
                         doc: doc_to_json_value(&h.id, &h.doc)?,
                     });
                 }
                 Ok(HakoResponse::PathResult { hits })
+            }
+            HakoOp::CreateEdgeIndex { collection } => {
+                gateway.db.create_edge_index(&collection).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
             }
             HakoOp::FindNear { collection, field, query, k } => {
                 // The pipeline drops scores, so recompute the exact metric
