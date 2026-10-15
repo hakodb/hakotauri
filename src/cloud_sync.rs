@@ -237,7 +237,11 @@ pub async fn toggle_cloud_sync(
                 let bind = bind_addr
                     .clone()
                     .unwrap_or_else(|| "0.0.0.0:8056".to_string());
-                let cs = CloudSync::server(db, &self_id, &auth_token);
+                // Single-room server: room params are mandatory here, not
+                // just for clients (a room-agnostic hub no longer exists).
+                let room_name = room_name.clone().unwrap_or_else(|| "default".to_string());
+                let room_key = room_key.clone().unwrap_or_default();
+                let cs = CloudSync::server(db, &self_id, &auth_token, &room_name, &room_key);
                 // Presented at every (re)connect handshake; set before start
                 // so the first handshake already carries it.
                 cs.set_api_key(api_key.clone());
