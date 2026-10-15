@@ -20,6 +20,7 @@ for the `@hakodb/tauri` TypeScript client.
 | 0.4.7 | `hakodb 0.13+` (facade: `socket-sync` plane + `DurabilityMode`/`HakoError`/`SocketSync` re-exports) | 2.11 (see below) |
 | 0.4.8 | `hakodb 0.14+` (graph: `create_traverse_index` + `find_paths` BFS) | 2.11 (see below) |
 | 0.4.9 | `hakodb 0.15+` (Phase B: `create_edge_index` + weighted `find_paths`) | 2.11 (see below) |
+| 0.4.10 | `hakodb 0.15.3` (ring-only TLS + shared sync framing) | 2.11 (see below) |
 
 > Consumers don't need a direct `hakodb` dependency: `use hakotauri::{Hako,
 > HakoConfig, HakoDoc, Value, BatchMutation, SortDirection, Operator, Query}`.
