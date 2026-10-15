@@ -1,6 +1,6 @@
 [package]
 name = "hakotauri"
-version = "0.4.9"
+version = "0.4.10"
 edition = "2021"
 description = "Tauri gateway commands for the HakoDB embedded document engine"
 license = "MIT"
