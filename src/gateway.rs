@@ -189,6 +189,8 @@ pub enum HakoOp {
         kind: AggregateKind,
         field: Option<String>,
     },
+    /// Cheap existence probe: no owned decode and no collection creation.
+    Exists { collection: String, doc_id: String },
     Subscribe {
         listener_id: String,
         doc_id_filter: Option<String>,
@@ -209,6 +211,8 @@ pub enum HakoOp {
     Unsubscribe { listener_id: String },
     Backup { path: String },
     Compact,
+    /// Compact one resident shard; absent/unloaded collections are a no-op.
+    CompactCollection { collection: String },
     /// Flush WAL + segments to disk (close path, deterministic tests).
     Flush,
     /// Doc ids in a collection (key scans for seeding, archive passes,
@@ -257,7 +261,9 @@ pub enum HakoResponse {
     ValueResult { value: Option<serde_json::Value> },
     /// Index readiness probe.
     Ready { ready: bool },
-    AggregateResult { value: f64 },
+    AggregateResult { value: Option<f64> },
+    /// Cheap existence probe (Exists).
+    Exists { exists: bool },
     SubscriptionAck { listener_id: String },
     Unsubscribed { listener_id: String },
     Collections { names: Vec<String> },
@@ -389,7 +395,7 @@ pub enum FilterOperator {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AggregateKind { Count, Sum, Avg }
+pub enum AggregateKind { Count, Sum, Avg, Min, Max }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -874,10 +880,13 @@ pub async fn hako_exec<R: Runtime>(
                     AggregateKind::Count => query.aggregate(AggregateOp::Count),
                     AggregateKind::Sum => query.aggregate(AggregateOp::Sum(field.ok_or("missing field")?)),
                     AggregateKind::Avg => query.aggregate(AggregateOp::Avg(field.ok_or("missing field")?)),
+                    AggregateKind::Min => query.aggregate(AggregateOp::Min(field.ok_or("missing field")?)),
+                    AggregateKind::Max => query.aggregate(AggregateOp::Max(field.ok_or("missing field")?)),
                 };
                 let result = gateway.db.execute_aggregation(query).map_err(|e| e.to_string())?;
-                let val = *result.values().next().unwrap_or(&0.0);
-                Ok(HakoResponse::AggregateResult { value: val })
+                // min/max over an empty set return no entry at all.
+                let value = result.into_values().next();
+                Ok(HakoResponse::AggregateResult { value })
             }
             HakoOp::Subscribe { listener_id, collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, event_name, start_at, start_after, end_at, end_before } => {
                 gateway.register_subscription(
@@ -906,6 +915,14 @@ pub async fn hako_exec<R: Runtime>(
             HakoOp::Compact => {
                 gateway.db.compact().map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
+            }
+            HakoOp::CompactCollection { collection } => {
+                gateway.db.compact_collection(&collection).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::Exists { collection, doc_id } => {
+                let exists = gateway.db.exists(&collection, &doc_id).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Exists { exists })
             }
             HakoOp::Flush => {
                 gateway.db.flush().map_err(|e| e.to_string())?;
@@ -1310,5 +1327,50 @@ mod casing_tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn minmax_exists_and_compact_collection_wire_shapes() {
+        // Aggregate kinds share one op; min/max add no new field.
+        for (kind, wire) in [("min", "min"), ("max", "max")] {
+            let op: HakoOp = serde_json::from_str(&format!(
+                r#"{{"op":"aggregate","collection":"c","kind":"{wire}","field":"n"}}"#
+            ))
+            .expect("must parse");
+            match op {
+                HakoOp::Aggregate { kind: parsed, field, .. } => {
+                    assert_eq!(field.as_deref(), Some("n"));
+                    assert!(matches!(
+                        (kind, parsed),
+                        ("min", AggregateKind::Min) | ("max", AggregateKind::Max)
+                    ));
+                }
+                _ => panic!("wrong variant"),
+            }
+        }
+
+        // Empty min/max -> absent entry -> null on the wire, not 0.0.
+        let res = HakoResponse::AggregateResult { value: None };
+        assert_eq!(
+            serde_json::to_value(&res).expect("serializes"),
+            serde_json::json!({ "aggregate_result": { "value": null } })
+        );
+
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"exists","collection":"c","doc_id":"d"}"#,
+        )
+        .expect("must parse");
+        assert!(matches!(op, HakoOp::Exists { .. }));
+        let res = HakoResponse::Exists { exists: true };
+        assert_eq!(
+            serde_json::to_value(&res).expect("serializes"),
+            serde_json::json!({ "exists": { "exists": true } })
+        );
+
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"compact_collection","collection":"c"}"#,
+        )
+        .expect("must parse");
+        assert!(matches!(op, HakoOp::CompactCollection { .. }));
     }
 }
