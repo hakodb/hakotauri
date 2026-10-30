@@ -73,7 +73,29 @@ pub enum HakoOp {
         /// When true the tombstone stays on this device (never replicates).
         #[serde(default)]
         local_only: bool,
+        /// Hard delete: skip the soft-delete retention/restore window.
+        #[serde(default)]
+        force: bool,
     },
+    /// Restore a soft-deleted doc from its retention record (fresh version).
+    Restore {
+        collection: String,
+        doc_id: String,
+    },
+    /// List restoreable soft-deleted docs; omitted collection lists all.
+    RestoreAvailable {
+        /// Omitted by old clients -> every collection.
+        #[serde(default)]
+        collection: Option<String>,
+    },
+    /// List soft-deleted docs due for the sweeper purge.
+    DeleteQueue {
+        /// Omitted by old clients -> every collection.
+        #[serde(default)]
+        collection: Option<String>,
+    },
+    /// Run one sweeper pass now; returns the purged record count.
+    Sweep,
     Vacuum { collection: String },
     CreateIndex { collection: String, field: String },
     CreateFtsIndex { collection: String, field: String },
@@ -272,6 +294,8 @@ pub enum HakoResponse {
     Stats { details: serde_json::Value },
     Indexes { list: serde_json::Value },
     AuditLog { entries: Vec<AuditEntry> },
+    /// Soft-delete retention records (restore_available / delete_queue).
+    Records { list: serde_json::Value },
     BulkActionResult { count: usize },
     /// Relocate report: moved ids + ids missing at source.
     RelocateResult { moved: Vec<String>, missing: Vec<String> },
@@ -381,6 +405,9 @@ pub struct BatchInput {
     /// Local-only scope for Delete items (Set/Patch ignore it).
     #[serde(default)]
     pub local_only: bool,
+    /// Hard-delete scope for Delete items (Set/Patch ignore it); soft is the default.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -690,13 +717,39 @@ pub async fn hako_exec<R: Runtime>(
                 gateway.db.patch(&collection, &doc_id, updates).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
             }
-            HakoOp::Delete { collection, doc_id, local_only } => {
+            HakoOp::Delete { collection, doc_id, local_only, force } => {
                 if local_only {
                     gateway.db.delete_local(&collection, &doc_id).map_err(|e| e.to_string())?;
+                } else if force {
+                    gateway.db.delete_force(&collection, &doc_id).map_err(|e| e.to_string())?;
                 } else {
                     gateway.db.delete(&collection, &doc_id).map_err(|e| e.to_string())?;
                 }
                 Ok(HakoResponse::Ok)
+            }
+            HakoOp::Restore { collection, doc_id } => {
+                gateway.db.restore(&collection, &doc_id).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::RestoreAvailable { collection } => {
+                let records = gateway
+                    .db
+                    .restore_available(collection.as_deref())
+                    .map_err(|e| e.to_string())?;
+                let list = serde_json::to_value(records).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Records { list })
+            }
+            HakoOp::DeleteQueue { collection } => {
+                let records = gateway
+                    .db
+                    .delete_queue(collection.as_deref())
+                    .map_err(|e| e.to_string())?;
+                let list = serde_json::to_value(records).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Records { list })
+            }
+            HakoOp::Sweep => {
+                let count = gateway.db.sweep_now().map_err(|e| e.to_string())?;
+                Ok(HakoResponse::BulkActionResult { count: count as usize })
             }
             HakoOp::Vacuum { collection } => {
                 let count = gateway.db.vacuum_collection(&collection).map_err(|e| e.to_string())?;
@@ -732,6 +785,11 @@ pub async fn hako_exec<R: Runtime>(
                     limit: k,
                     via_edge: via,
                     weight_field: weight,
+                    node_match: None,
+                    edge_type: None,
+                    edge_match: None,
+                    include_path: false,
+                    include_via: false,
                 };
                 let rows = gateway.db.find_paths(&collection, &doc_id, &spec).map_err(|e| e.to_string())?;
                 let mut hits = Vec::with_capacity(rows.len());
@@ -846,8 +904,12 @@ pub async fn hako_exec<R: Runtime>(
                         BatchMutationKind::Delete if item.local_only => {
                             local_dels.entry(item.collection).or_default().push(item.doc_id);
                         }
-                        BatchMutationKind::Delete => {
+                        // Soft by default; `Delete` is the legacy hard variant.
+                        BatchMutationKind::Delete if item.force => {
                             batch.push(BatchMutation::Delete { collection: item.collection, doc_id: item.doc_id });
+                        }
+                        BatchMutationKind::Delete => {
+                            batch.push(BatchMutation::SoftDelete { collection: item.collection, doc_id: item.doc_id });
                         }
                     }
                 }
@@ -1211,6 +1273,49 @@ mod casing_tests {
             HakoOp::Delete { local_only, .. } => assert!(local_only),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn soft_delete_op_wire_shapes() {
+        // force and the queue filter default off/every-collection for old clients.
+        let op: HakoOp =
+            serde_json::from_str(r#"{"op":"delete","collection":"c","doc_id":"a"}"#)
+                .expect("old clients omit both flags");
+        match op {
+            HakoOp::Delete { local_only, force, .. } => {
+                assert!(!local_only);
+                assert!(!force, "old clients omit force -> soft");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op: HakoOp =
+            serde_json::from_str(r#"{"op":"restore","collection":"c","doc_id":"a"}"#)
+                .expect("restore must parse");
+        assert!(matches!(op, HakoOp::Restore { .. }));
+
+        let op: HakoOp =
+            serde_json::from_str(r#"{"op":"restore_available"}"#).expect("collection omittable");
+        match op {
+            HakoOp::RestoreAvailable { collection } => assert_eq!(collection, None),
+            _ => panic!("wrong variant"),
+        }
+
+        let op: HakoOp =
+            serde_json::from_str(r#"{"op":"delete_queue","collection":"c"}"#).expect("must parse");
+        assert!(matches!(op, HakoOp::DeleteQueue { .. }));
+
+        let op: HakoOp = serde_json::from_str(r#"{"op":"sweep"}"#).expect("sweep must parse");
+        assert!(matches!(op, HakoOp::Sweep));
+
+        let res = HakoResponse::Records {
+            list: serde_json::json!([{ "col": "c", "id": "a" }]),
+        };
+        let v = serde_json::to_value(&res).expect("serializes");
+        assert_eq!(
+            v,
+            serde_json::json!({"records": { "list": [{ "col": "c", "id": "a" }]}})
+        );
     }
 
     #[test]
