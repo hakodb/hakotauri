@@ -9,20 +9,8 @@ for the `@hakodb/tauri` TypeScript client.
 
 ## Compatibility
 
-| hakotauri | hako core | tauri |
-|---|---|---|
-| 0.3.0 | `hakodb 0.8.23+` (crates.io) | 2.11 (see below) |
-| 0.4.2 | `hakodb 0.12.2` (archive: relocate/load/unload wired to ops) | 2.11 (see below) |
-| 0.4.3 | `hakodb 0.12.4` (WAL reserve ratchet fix; Interval files follow data size) | 2.11 (see below) |
-| 0.4.4 | `hakodb 0.13+` (vector: `create_vector_index` + `find_near`) | 2.11 (see below) |
-| 0.4.5 | `hakodb 0.13+` (consumer ops: `flush` + `list_storage_keys`) | 2.11 (see below) |
-| 0.4.6 | `hakodb 0.13+` (facade: engine re-exports + optional `net-sync`/`cloud-sync` features) | 2.11 (see below) |
-| 0.4.7 | `hakodb 0.13+` (facade: `socket-sync` plane + `DurabilityMode`/`HakoError`/`SocketSync` re-exports) | 2.11 (see below) |
-| 0.4.8 | `hakodb 0.14+` (graph: `create_traverse_index` + `find_paths` BFS) | 2.11 (see below) |
-| 0.4.9 | `hakodb 0.15+` (Phase B: `create_edge_index` + weighted `find_paths`) | 2.11 (see below) |
-| 0.4.10 | `hakodb 0.15.3` (ring-only TLS + shared sync framing) | 2.11 (see below) |
-| 0.4.11 | `hakodb 0.17.1` (engine JSON read paths ride along; no new ops) | 2.11 (see below) |
-| 0.5.0 | `hakodb 0.19.0` (`min`/`max` aggregates, `exists` + `compact_collection` ops, nullable aggregate value) | 2.11 (see below) |
+Each release pairs with a matching `hakodb` tag (see the releases page
+for the exact pairing).
 
 > Consumers don't need a direct `hakodb` dependency: `use hakotauri::{Hako,
 > HakoConfig, HakoDoc, Value, BatchMutation, SortDirection, Operator, Query}`.
