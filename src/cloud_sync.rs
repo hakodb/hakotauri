@@ -164,6 +164,7 @@ fn save_config(gateway: &HakoGateway, config: &CloudSyncConfig) {
 /// client mode, `server_url` points to the central server (ws:// or wss://).
 /// In server mode, `bind_addr` is the bind address to host the cloud hub.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn toggle_cloud_sync(
     enabled: bool,
     mode: String,
@@ -192,7 +193,7 @@ pub async fn toggle_cloud_sync(
 
     let config = CloudSyncConfig {
         enabled,
-        mode: mode.clone(),
+        mode,
         server_url: server_url.clone(),
         bind_addr: bind_addr.clone(),
         room_name: room_name.clone(),
@@ -490,13 +491,13 @@ pub async fn cloud_group_add_member(
     if !policy.members.iter().any(|m| m == &client_id) {
         policy.members.push(client_id);
     }
-    Ok(group_set_inner(
+    group_set_inner(
         gw,
         &policy.room_name,
         &policy.mode,
         None,
         Some(policy.members),
-    )?)
+    )
 }
 
 /// Removes a client id from a room's member allowlist.
@@ -513,13 +514,13 @@ pub async fn cloud_group_remove_member(
         .into_iter()
         .filter(|m| m != client_id.trim())
         .collect();
-    Ok(group_set_inner(
+    group_set_inner(
         gw,
         &policy.room_name,
         &policy.mode,
         None,
         Some(members),
-    )?)
+    )
 }
 
 /// Re-enable Cloud Sync on startup if it was previously enabled.

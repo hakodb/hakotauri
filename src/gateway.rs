@@ -43,6 +43,7 @@ use hakodb::config::DurabilityMode;
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::{AuditEntry, BatchMutation, ChangeKind, Hako};
+use hakodb::error::HakoError;
 use hakodb::index::composite::definition::SortDirection;
 use hakodb::index::vector::{decode_f32s, distance, Metric};
 use hakodb::query::filter::{Filter, Operator};
@@ -107,6 +108,14 @@ pub enum HakoOp {
         /// Omitted by old clients -> cosine (the RAG default).
         #[serde(default)]
         metric: VectorMetric,
+        /// HNSW knobs (#141-1), all optional: omitted/0 ride the per-dim
+        /// derived defaults. Persist in the index definition, survive reopen.
+        #[serde(default)]
+        m: Option<usize>,
+        #[serde(default)]
+        ef_construction: Option<usize>,
+        #[serde(default)]
+        ef_search: Option<usize>,
     },
     CreateTraverseIndex {
         collection: String,
@@ -129,16 +138,72 @@ pub enum HakoOp {
         /// Omitted by old clients -> 100.
         #[serde(default = "default_traverse_k")]
         k: usize,
-        /// Phase B: edge collection (docs with _from/_to join the walk).
+        /// Edge collection (docs with _from/_to join the walk).
         via: Option<String>,
-        /// Phase B: numeric prop on edge docs for Dijkstra ordering.
+        /// Numeric prop on edge docs for Dijkstra ordering.
         weight: Option<String>,
+        /// Node predicate: prune-at-expansion (spec.node_match).
+        #[serde(default)]
+        node_match: Option<PropMatch>,
+        /// Edge-collection relationship routing: ("type", value)-style.
+        #[serde(default)]
+        edge_type: Option<PropMatch>,
+        /// Edge-collection property filter (ANDs with edge_type).
+        #[serde(default)]
+        edge_match: Option<PropMatch>,
+        /// Route projections are opt-in (0.19.5): false keeps the v0.19.3
+        /// engine cost; true fills PathHit.path/via.
+        #[serde(default)]
+        include_path: bool,
+        #[serde(default)]
+        include_via: bool,
+    },
+    /// Cycle-safe simple-path enumeration: like FindPaths but never
+    /// revisits a node (k-shortest paths without cycles).
+    FindSimplePaths {
+        collection: String,
+        doc_id: String,
+        #[serde(default)]
+        direction: TraverseDirection,
+        edge: Option<String>,
+        #[serde(default = "default_traverse_depth")]
+        max_depth: usize,
+        #[serde(default = "default_traverse_k")]
+        k: usize,
+        via: Option<String>,
+        weight: Option<String>,
+        #[serde(default)]
+        node_match: Option<PropMatch>,
+        #[serde(default)]
+        edge_type: Option<PropMatch>,
+        #[serde(default)]
+        edge_match: Option<PropMatch>,
+        #[serde(default)]
+        include_path: bool,
+        #[serde(default)]
+        include_via: bool,
     },
     FindNear {
         collection: String,
         field: String,
         query: Vec<f32>,
         /// Omitted by old clients -> 10.
+        #[serde(default = "default_near_k")]
+        k: usize,
+        /// Distance cutoff (#141-11): keep only hits at or under the bound.
+        #[serde(default)]
+        max_distance: Option<f64>,
+        /// Hybrid search (#141): extra filters ANDed with the near
+        /// predicate — the planner ANN-pre-filters or over-fetches.
+        #[serde(default)]
+        filters: Vec<FilterInput>,
+    },
+    /// Batched KNN (#141-5): one readiness cycle for many query vectors.
+    /// Results align 1:1 with `queries`, each nearest-first like FindNear.
+    FindNearBatch {
+        collection: String,
+        field: String,
+        queries: Vec<Vec<f32>>,
         #[serde(default = "default_near_k")]
         k: usize,
     },
@@ -261,6 +326,93 @@ pub enum HakoOp {
     UnloadCollection { collection: String },
     /// Archive-group collections on disk but not loaded.
     UnloadedCollections,
+    /// Serializable read-modify-write with bounded retry: steps run in
+    /// order inside one engine transaction; a read-set conflict retries
+    /// the WHOLE step list on a fresh snapshot. Get steps collect their
+    /// documents into the response (aligned, in step order).
+    Transaction {
+        steps: Vec<TxnStep>,
+        /// Omitted by old clients -> 3 (engine default attempts).
+        #[serde(default = "default_tx_attempts")]
+        max_attempts: u32,
+    },
+    /// Multi-stage pipeline over one collection: match replaces the row
+    /// set, every other stage transforms it (seeding from a full scan
+    /// when it runs before any match).
+    Pipeline {
+        collection: String,
+        stages: Vec<StageInput>,
+    },
+    /// Drop one index definition (and its structures). Kind selects the
+    /// manager surface: simple/fts/vector take `field`, composite takes
+    /// `id` (from ListIndexes), traverse/edge take the collection only.
+    DropIndex {
+        kind: DropIndexKind,
+        collection: String,
+        #[serde(default)]
+        field: Option<String>,
+        #[serde(default)]
+        id: Option<u32>,
+    },
+    /// Whole-graph algorithms (0.19.4): connected components, one directed
+    /// cycle, topological sort, degree centrality — over the spec's
+    /// adjacency. Result rides ValueResult (arrays of [collection, id]).
+    GraphAnalysis {
+        collection: String,
+        kind: GraphAnalysisKind,
+        #[serde(default)]
+        direction: TraverseDirection,
+        #[serde(default)]
+        edge: Option<String>,
+        #[serde(default)]
+        via: Option<String>,
+        /// Optional node predicate limiting the graph's node set.
+        #[serde(default)]
+        node_match: Option<PropMatch>,
+    },
+    /// Export one collection's graph as viz-ready JSON (nodes + edges).
+    ExportGraph {
+        collection: String,
+        #[serde(default)]
+        direction: TraverseDirection,
+        #[serde(default)]
+        edge: Option<String>,
+        #[serde(default)]
+        via: Option<String>,
+    },
+    /// Point read with the storage version attached (optimistic
+    /// concurrency on the client).
+    GetVersioned { collection: String, doc_id: String },
+    /// Resolve one `{"__ref__": "col/id"}` reference value to its doc.
+    GetByRef { reference: serde_json::Value },
+    /// Write one document under the subcollection namespace of a parent
+    /// doc (`{col}/{id}/{subcollection}` storage prefix).
+    PutSubdocument {
+        collection: String,
+        doc_id: String,
+        subcollection: String,
+        subdoc_id: String,
+        data: serde_json::Value,
+    },
+    /// Rename a collection (storage prefix move; returns the new version).
+    RenameCollection { from: String, to: String },
+    /// Hard-drop a whole collection: tombstones every live doc, unlinks
+    /// the shard directory. Idempotent (absent = empty report).
+    DropCollection { collection: String },
+    /// Un-withhold from replication: a doc_id scopes to one key,
+    /// otherwise the whole collection's local-only marks clear.
+    Replicate {
+        collection: String,
+        #[serde(default)]
+        doc_id: Option<String>,
+    },
+    /// Operational visibility: what background work is outstanding
+    /// (index recovery, pending index ops, backfills, blob bytes).
+    Quiescence,
+    /// Pin/unpin a collection to this instance only (never replicates).
+    SetCollectionLocal { collection: String, local: bool },
+    /// Whole-engine read-only toggle (rejects writes, serves reads).
+    SetReadOnly { enabled: bool },
 }
 
 /// One raw row over the bridge: id in the clear, storage bytes as
@@ -302,9 +454,18 @@ pub enum HakoResponse {
     /// KNN hits: nearest-first, exact score per hit (same `distance()` the
     /// executor rescore uses — the graph only prunes, never orders).
     NearResult { hits: Vec<NearHit> },
+    /// Batched KNN: one result set per query vector, aligned 1:1.
+    NearBatchResult { results: Vec<Vec<NearHit>> },
     /// Graph BFS hits in walk order (collection + id: paths cross
     /// collections; depth = hops from the anchor).
     PathResult { hits: Vec<PathHit> },
+    /// Transaction commit: documents captured by Get steps, aligned in
+    /// step order (null = absent at snapshot).
+    TransactionResult { docs: Vec<Option<serde_json::Value>> },
+    /// Point read with its storage version (GetVersioned).
+    DocumentVersion { data: Option<serde_json::Value>, version: u64 },
+    /// Drop report: tombstoned live docs + reclaimed shard bytes.
+    DropResult { docs_removed: u64, bytes_reclaimed: u64, collections_dropped: Vec<String> },
 }
 
 /// One path hit: where it lives, its id, BFS depth, and the doc itself
@@ -317,6 +478,21 @@ pub struct PathHit {
     pub depth: u64,
     pub cost: f64,
     pub doc: serde_json::Value,
+    /// Full discovery path start->hit, inclusive both ends (FindPaths /
+    /// FindSimplePaths with include_path; absent otherwise).
+    #[serde(default)]
+    pub path: Option<Vec<PathNode>>,
+    /// Edge doc per hop, positionally aligned with `path` hops
+    /// (include_via; absent otherwise).
+    #[serde(default)]
+    pub via: Option<Vec<Option<String>>>,
+}
+
+/// One (collection, doc id) node on a traversal route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathNode {
+    pub collection: String,
+    pub id: String,
 }
 
 /// One KNN hit: doc id, exact metric distance, and the doc itself (with
@@ -432,6 +608,102 @@ pub struct CompositeFieldInput {
     pub desc: bool,
 }
 
+/// One (field, value) predicate for traversal routing/filtering:
+/// node_match prunes at expansion, edge_type routes edge-collection
+/// hops, edge_match filters edge properties (ANDs with edge_type).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropMatch {
+    pub field: String,
+    pub value: serde_json::Value,
+}
+
+/// One step inside a Transaction op, in execution order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxnStep {
+    pub kind: TxnStepKind,
+    pub collection: String,
+    pub doc_id: String,
+    /// Set/Patch payload (ignored by Get/Delete).
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+    /// Delete only: true = legacy hard delete, false = soft (default).
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxnStepKind { Get, Set, Patch, Delete }
+
+fn default_tx_attempts() -> u32 {
+    3
+}
+
+/// One pipeline stage, wire-tagged ("match"/"project"/...). Group
+/// accumulators mirror the Aggregate op's kinds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum StageInput {
+    Match {
+        #[serde(default)]
+        filters: Vec<FilterInput>,
+        #[serde(default)]
+        or_groups: Option<Vec<Vec<FilterInput>>>,
+        order_by: Option<Vec<OrderByInput>>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        projection: Option<Vec<String>>,
+        start_at: Option<Vec<serde_json::Value>>,
+        start_after: Option<Vec<serde_json::Value>>,
+        end_at: Option<Vec<serde_json::Value>>,
+        end_before: Option<Vec<serde_json::Value>>,
+        doc_id_filter: Option<String>,
+    },
+    Project { fields: Vec<String> },
+    Sort { field: String, #[serde(default)] ascending: bool },
+    Limit { n: usize },
+    Offset { n: usize },
+    Unwind { field: String },
+    Group {
+        key: Option<String>,
+        accums: Vec<AccumInput>,
+    },
+}
+
+/// One accumulator in a Group stage: `out` names the output field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccumInput {
+    pub out: String,
+    pub kind: AggregateKind,
+    /// Ignored by count.
+    #[serde(default)]
+    pub field: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropIndexKind { Simple, Fts, Vector, Traverse, Edge, Composite }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphAnalysisKind { Components, Cycle, Topo, Degrees }
+
+/// Wire spec shared by FindPaths / FindSimplePaths.
+#[derive(Debug, Clone)]
+struct TraverseInput {
+    direction: TraverseDirection,
+    edge: Option<String>,
+    max_depth: usize,
+    k: usize,
+    via: Option<String>,
+    weight: Option<String>,
+    node_match: Option<PropMatch>,
+    edge_type: Option<PropMatch>,
+    edge_match: Option<PropMatch>,
+    include_path: bool,
+    include_via: bool,
+}
+
 /// Shared handle the consumer manages with Tauri (`app.manage(...)`) and
 /// every command below borrows via `State`. `db` is public so out-of-tree
 /// crates (sync commands, admin tools) can reuse the same engine handle.
@@ -537,10 +809,7 @@ impl HakoGateway {
         
         tokio::task::spawn_blocking(move || {
             // 1. Bootstrap: the current rows as one `Full` change.
-            let initial_rows = match execute_query_input(&db, &query_template) {
-                Ok(rows) => rows,
-                Err(_) => Vec::new(),
-            };
+            let initial_rows = execute_query_input(&db, &query_template).unwrap_or_default();
 
             let bootstrap_payload = DeltaPayload {
                 listener_id: lid.clone(),
@@ -681,6 +950,8 @@ pub enum QueryAction {
     Fetch,
     Delete,
     Patch { data: serde_json::Value },
+    /// Plan-only: no execution, returns the explain report.
+    Explain,
 }
 
 /// The one Tauri command. Every op runs on a blocking worker (the engine
@@ -769,55 +1040,70 @@ pub async fn hako_exec<R: Runtime>(
                 gateway.db.persist_index_defs().map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
             }
-            HakoOp::CreateVectorIndex { collection, field, dim, metric } => {
-                gateway.db.create_vector_index(&collection, &field, dim, metric.metric()).map_err(|e| e.to_string())?;
+            HakoOp::CreateVectorIndex { collection, field, dim, metric, m, ef_construction, ef_search } => {
+                let params = hakodb::index::vector::HnswParams {
+                    m,
+                    ef_construction,
+                    ef_search,
+                };
+                gateway.db.create_vector_index_with_params(&collection, &field, dim, metric.metric(), params).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
             }
             HakoOp::CreateTraverseIndex { collection } => {
                 gateway.db.create_traverse_index(&collection).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
             }
-            HakoOp::FindPaths { collection, doc_id, direction, edge, max_depth, k, via, weight } => {
-                let spec = hakodb::index::traverse::TraverseSpec {
-                    direction: direction.engine(),
-                    edge_field: edge,
-                    max_depth,
-                    limit: k,
-                    via_edge: via,
-                    weight_field: weight,
-                    node_match: None,
-                    edge_type: None,
-                    edge_match: None,
-                    include_path: false,
-                    include_via: false,
-                };
-                let rows = gateway.db.find_paths(&collection, &doc_id, &spec).map_err(|e| e.to_string())?;
-                let mut hits = Vec::with_capacity(rows.len());
-                for h in &rows {
-                    hits.push(PathHit {
-                        collection: h.collection.clone(),
-                        id: h.id.clone(),
-                        depth: h.depth as u64,
-                        cost: h.cost,
-                        doc: doc_to_json_value(&h.id, &h.doc)?,
-                    });
-                }
-                Ok(HakoResponse::PathResult { hits })
+            HakoOp::FindPaths { collection, doc_id, direction, edge, max_depth, k, via, weight, node_match, edge_type, edge_match, include_path, include_via } => {
+                let input = TraverseInput { direction, edge, max_depth, k, via, weight, node_match, edge_type, edge_match, include_path, include_via };
+                run_find_paths(&gateway.db, collection, doc_id, input, false)
+            }
+            HakoOp::FindSimplePaths { collection, doc_id, direction, edge, max_depth, k, via, weight, node_match, edge_type, edge_match, include_path, include_via } => {
+                let input = TraverseInput { direction, edge, max_depth, k, via, weight, node_match, edge_type, edge_match, include_path, include_via };
+                run_find_paths(&gateway.db, collection, doc_id, input, true)
             }
             HakoOp::CreateEdgeIndex { collection } => {
                 gateway.db.create_edge_index(&collection).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
             }
-            HakoOp::FindNear { collection, field, query, k } => {
-                // The pipeline drops scores, so recompute the exact metric
-                // distance per hit from the stored document vector — twin of
-                // `hk_engine_find_near` in hakodb's ffi.rs (kept inline: one
-                // shared helper would couple this crate's release train to
-                // core's; promote it if a third consumer appears).
+            HakoOp::FindNear { collection, field, query, k, max_distance, filters } => {
+                // Exact rescore per hit from the stored document vector —
+                // twin of `hk_engine_find_near` in hakodb's ffi.rs (kept
+                // inline: one shared helper would couple this crate's
+                // release train to core's; promote it if a third consumer
+                // appears). Hybrid filters ride the query planner
+                // (index-satisfied pre-filter or over-fetch + post-filter).
+                let rows = if filters.is_empty() {
+                    // Exact scores come back pre-computed; drop them here —
+                    // the rescore loop below recomputes from the stored
+                    // document either way.
+                    gateway.db
+                        .find_near_scored(&collection, &field, &query, k, max_distance)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(|(id, _score, doc)| (id, doc))
+                        .collect::<Vec<_>>()
+                } else {
+                    let q = build_query_from_input(&QueryInput {
+                        collection: collection.clone(),
+                        doc_id_filter: None,
+                        or_groups: None,
+                        order_by: None,
+                        limit: Some(k),
+                        offset: None,
+                        projection: None,
+                        start_at: None, start_after: None, end_at: None, end_before: None,
+                        defer_blobs: false,
+                        local_only: false,
+                        filters,
+                    })?;
+                    // The near predicate itself: engine ANN lane + rescore.
+                    let bytes = hakodb::index::vector::encode_f32s(&query);
+                    let q = q.where_filter(&field, Operator::Near, Value::Binary(bytes));
+                    gateway.db.query(q).map_err(|e| e.to_string())?
+                };
                 let metric = gateway.db.vector_metric(&collection, &field).unwrap_or(Metric::Cosine);
-                let rows = gateway.db.find_near(&collection, &field, &query, k).map_err(|e| e.to_string())?;
                 let mut hits = Vec::with_capacity(rows.len());
-                for (id, doc) in &rows {
+                for (id, doc) in rows {
                     let score = match doc.get(&field) {
                         Some(Value::Binary(b)) => decode_f32s(b)
                             .ok()
@@ -826,9 +1112,37 @@ pub async fn hako_exec<R: Runtime>(
                             .unwrap_or(f64::INFINITY),
                         _ => f64::INFINITY,
                     };
-                    hits.push(NearHit { id: id.clone(), score, doc: doc_to_json_value(id, doc)? });
+                    if let Some(max) = max_distance {
+                        if score > max { continue; }
+                    }
+                    let json = doc_to_json_value(&id, &doc)?;
+                    hits.push(NearHit { id, score, doc: json });
                 }
                 Ok(HakoResponse::NearResult { hits })
+            }
+            HakoOp::FindNearBatch { collection, field, queries, k } => {
+                let refs: Vec<&[f32]> = queries.iter().map(|q| q.as_slice()).collect();
+                let batch = gateway.db.find_near_batch(&collection, &field, &refs, k).map_err(|e| e.to_string())?;
+                let metric = gateway.db.vector_metric(&collection, &field).unwrap_or(Metric::Cosine);
+                let mut results = Vec::with_capacity(batch.len());
+                for (qi, rows) in batch.into_iter().enumerate() {
+                    let query = &queries[qi];
+                    let mut hits = Vec::with_capacity(rows.len());
+                    for (id, doc) in rows {
+                        let score = match doc.get(&field) {
+                            Some(Value::Binary(b)) => decode_f32s(b)
+                                .ok()
+                                .filter(|v| v.len() == query.len())
+                                .map(|v| distance(metric, query, &v))
+                                .unwrap_or(f64::INFINITY),
+                            _ => f64::INFINITY,
+                        };
+                        let json = doc_to_json_value(&id, &doc)?;
+                        hits.push(NearHit { id, score, doc: json });
+                    }
+                    results.push(hits);
+                }
+                Ok(HakoResponse::NearBatchResult { results })
             }
             HakoOp::Query { collection, action, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs, local_only } => {
                 let input = QueryInput { 
@@ -853,6 +1167,12 @@ pub async fn hako_exec<R: Runtime>(
                         let updates = json_to_vec(&data)?;
                         let count = gateway.db.patch_where(query_obj, updates).map_err(|e| e.to_string())?;
                         Ok(HakoResponse::BulkActionResult { count })
+                    }
+                    QueryAction::Explain => {
+                        let report = gateway.db.explain_report(query_obj).map_err(|e| e.to_string())?;
+                        Ok(HakoResponse::ValueResult {
+                            value: Some(serde_json::to_value(report).map_err(|e| e.to_string())?),
+                        })
                     }
                 }
             }
@@ -1043,6 +1363,232 @@ pub async fn hako_exec<R: Runtime>(
             HakoOp::UnloadedCollections => {
                 Ok(HakoResponse::Collections { names: gateway.db.unloaded_lazy_collections() })
             }
+            HakoOp::Transaction { steps, max_attempts } => {
+                let policy = hakodb::engine::RetryPolicy::exponential(
+                    max_attempts.max(1),
+                    std::time::Duration::from_millis(25),
+                    std::time::Duration::from_millis(400),
+                );
+                let db = Arc::clone(&gateway.db);
+                // Get-step docs are captured INSIDE the body: a retry reruns
+                // the whole step list on a fresh snapshot, so only the docs
+                // read by the attempt that finally commits are returned.
+                let gets: Vec<(String, String)> = steps.iter()
+                    .filter(|s| matches!(s.kind, TxnStepKind::Get))
+                    .map(|s| (s.collection.clone(), s.doc_id.clone()))
+                    .collect();
+                let docs = gateway.db.transaction(policy, |tx| {
+                    let mut docs = Vec::with_capacity(gets.len());
+                    for step in &steps {
+                        match step.kind {
+                            TxnStepKind::Get => {
+                                docs.push(tx.get(&db, &step.collection, &step.doc_id)?);
+                            }
+                            TxnStepKind::Set => {
+                                let data = step.data.as_ref()
+                                    .ok_or_else(|| HakoError::InvalidInput("missing data".into()))?;
+                                let doc = json_to_doc(data).map_err(HakoError::InvalidInput)?;
+                                tx.put(&step.collection, &step.doc_id, doc);
+                            }
+                            TxnStepKind::Patch => {
+                                let data = step.data.as_ref()
+                                    .ok_or_else(|| HakoError::InvalidInput("missing data".into()))?;
+                                let updates = json_to_vec(data).map_err(HakoError::InvalidInput)?;
+                                tx.patch(&db, &step.collection, &step.doc_id, updates)?;
+                            }
+                            TxnStepKind::Delete => {
+                                if step.force { tx.delete_force(&step.collection, &step.doc_id); }
+                                else { tx.delete(&step.collection, &step.doc_id); }
+                            }
+                        }
+                    }
+                    Ok(docs)
+                }).map_err(|e| e.to_string())?;
+                let mut out = Vec::with_capacity(docs.len());
+                for (i, doc) in docs.into_iter().enumerate() {
+                    let id = &gets[i].1;
+                    out.push(match doc {
+                        Some(d) => Some(doc_to_json_value(id, &d)?),
+                        None => None,
+                    });
+                }
+                Ok(HakoResponse::TransactionResult { docs: out })
+            }
+            HakoOp::Pipeline { collection, stages } => {
+                use hakodb::query::pipeline::{Accum, AccumSpec, Pipeline as EnginePipeline, Stage};
+                let mut pipeline = EnginePipeline::new(&collection);
+                for stage in stages {
+                    pipeline = pipeline.stage(match stage {
+                        StageInput::Match { filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, doc_id_filter } => {
+                            let input = QueryInput {
+                                collection: collection.clone(),
+                                doc_id_filter, filters, or_groups, order_by,
+                                limit, offset, projection,
+                                start_at, start_after, end_at, end_before,
+                                defer_blobs: false,
+                                local_only: false,
+                            };
+                            Stage::Match(build_query_from_input(&input)?)
+                        }
+                        StageInput::Project { fields } => Stage::Project(fields),
+                        StageInput::Sort { field, ascending } => Stage::Sort { field, ascending },
+                        StageInput::Limit { n } => Stage::Limit(n),
+                        StageInput::Offset { n } => Stage::Offset(n),
+                        StageInput::Unwind { field } => Stage::Unwind { field },
+                        StageInput::Group { key, accums } => {
+                            let mut specs = Vec::with_capacity(accums.len());
+                            for a in accums {
+                                let op = match a.kind {
+                                    AggregateKind::Count => Accum::Count,
+                                    AggregateKind::Sum => Accum::Sum(a.field.ok_or("missing field")?),
+                                    AggregateKind::Avg => Accum::Avg(a.field.ok_or("missing field")?),
+                                    AggregateKind::Min => Accum::Min(a.field.ok_or("missing field")?),
+                                    AggregateKind::Max => Accum::Max(a.field.ok_or("missing field")?),
+                                };
+                                specs.push(AccumSpec { out: a.out, op });
+                            }
+                            Stage::Group { key, accums: specs }
+                        }
+                    });
+                }
+                let rows = gateway.db.run_pipeline(pipeline).map_err(|e| e.to_string())?;
+                let out = rows.into_par_iter()
+                    .map(|(id, doc)| doc_to_json_value(&id, &doc).unwrap_or(serde_json::Value::Null))
+                    .collect();
+                Ok(HakoResponse::QueryResult { rows: out })
+            }
+            HakoOp::DropIndex { kind, collection, field, id } => {
+                match kind {
+                    DropIndexKind::Simple => gateway.db.drop_index(&collection, field.as_deref().ok_or("missing field")?).map_err(|e| e.to_string())?,
+                    DropIndexKind::Fts => gateway.db.drop_fts_index(&collection, field.as_deref().ok_or("missing field")?).map_err(|e| e.to_string())?,
+                    DropIndexKind::Vector => gateway.db.drop_vector_index(&collection, field.as_deref().ok_or("missing field")?).map_err(|e| e.to_string())?,
+                    DropIndexKind::Traverse => gateway.db.drop_traverse_index(&collection).map_err(|e| e.to_string())?,
+                    DropIndexKind::Edge => gateway.db.drop_edge_index(&collection).map_err(|e| e.to_string())?,
+                    DropIndexKind::Composite => gateway.db.drop_composite_index(&collection, id.ok_or("missing id")?).map_err(|e| e.to_string())?,
+                }
+                gateway.db.persist_index_defs().map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::GetVersioned { collection, doc_id } => {
+                match gateway.db.get_versioned(&collection, &doc_id).map_err(|e| e.to_string())? {
+                    Some((doc, version)) => {
+                        let data = doc_to_json_value(&doc_id, &doc)?;
+                        Ok(HakoResponse::DocumentVersion { data: Some(data), version })
+                    }
+                    None => Ok(HakoResponse::DocumentVersion { data: None, version: 0 }),
+                }
+            }
+            HakoOp::GetByRef { reference } => {
+                // Wire shape: `{"__ref__": "col/id"}` — the exact form
+                // doc_to_json_value emits for Value::Reference.
+                let (ref_col, ref_id) = match &reference {
+                    serde_json::Value::Object(map) => match map.get("__ref__")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.split_once('/'))
+                    {
+                        Some((c, i)) => (c.to_string(), i.to_string()),
+                        None => return Ok(HakoResponse::Document { data: None }),
+                    },
+                    _ => return Ok(HakoResponse::Document { data: None }),
+                };
+                let doc = gateway.db
+                    .get_by_reference(&Value::Reference { collection: ref_col, doc_id: ref_id.clone() })
+                    .map_err(|e| e.to_string())?;
+                let data = doc.map(|d| doc_to_json_value(&ref_id, &d)).transpose()?;
+                Ok(HakoResponse::Document { data })
+            }
+            HakoOp::PutSubdocument { collection, doc_id, subcollection, subdoc_id, data } => {
+                let doc = json_to_doc(&data)?;
+                let id = gateway.db.put_subdocument(&collection, &doc_id, &subcollection, &subdoc_id, &doc).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::ValueResult { value: Some(serde_json::Value::String(id)) })
+            }
+            HakoOp::RenameCollection { from, to } => {
+                gateway.db.rename_collection(&from, &to).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::DropCollection { collection } => {
+                let rep = gateway.db.drop_collection(&collection).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::DropResult {
+                    docs_removed: rep.docs_removed,
+                    bytes_reclaimed: rep.bytes_reclaimed,
+                    collections_dropped: rep.collections_dropped,
+                })
+            }
+            HakoOp::Replicate { collection, doc_id } => {
+                match doc_id {
+                    Some(id) => gateway.db.replicate_key(&collection, &id),
+                    None => gateway.db.replicate_collection(&collection),
+                }
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::Quiescence => {
+                // QuiescenceStatus is a plain C-facing struct (no Serialize);
+                // hand-build the JSON so the wire shape is explicit.
+                let s = gateway.db.quiescence_status();
+                let value = serde_json::json!({
+                    "indexes_ready": s.indexes_ready,
+                    "pending_index_ops": s.pending_index_ops,
+                    "index_backfills": s.index_backfills,
+                    "pending_blob_bytes": s.pending_blob_bytes,
+                    "queued_blob_items": s.queued_blob_items,
+                    "maintenance_running": s.maintenance_running,
+                });
+                Ok(HakoResponse::ValueResult { value: Some(value) })
+            }
+            HakoOp::SetCollectionLocal { collection, local } => {
+                gateway.db.set_collection_local(&collection, local);
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::SetReadOnly { enabled } => {
+                gateway.db.set_read_only(enabled);
+                Ok(HakoResponse::Ok)
+            }
+            HakoOp::GraphAnalysis { collection, kind, direction, edge, via, node_match } => {
+                let spec = build_traverse_spec(&TraverseInput {
+                    direction, edge, via, node_match,
+                    max_depth: default_traverse_depth(),
+                    k: default_traverse_k(),
+                    weight: None,
+                    edge_type: None,
+                    edge_match: None,
+                    include_path: false,
+                    include_via: false,
+                })?;
+                let value = match kind {
+                    GraphAnalysisKind::Components => {
+                        let comps = gateway.db.graph_components(&collection, &spec).map_err(|e| e.to_string())?;
+                        serde_json::to_value(comps).map_err(|e| e.to_string())?
+                    }
+                    GraphAnalysisKind::Cycle => {
+                        let cycle = gateway.db.graph_find_cycle(&collection, &spec).map_err(|e| e.to_string())?;
+                        serde_json::to_value(cycle).map_err(|e| e.to_string())?
+                    }
+                    GraphAnalysisKind::Topo => {
+                        let order = gateway.db.graph_topo_sort(&collection, &spec).map_err(|e| e.to_string())?;
+                        serde_json::to_value(order).map_err(|e| e.to_string())?
+                    }
+                    GraphAnalysisKind::Degrees => {
+                        let rows = gateway.db.graph_degree_centrality(&collection, &spec).map_err(|e| e.to_string())?;
+                        serde_json::to_value(rows).map_err(|e| e.to_string())?
+                    }
+                };
+                Ok(HakoResponse::ValueResult { value: Some(value) })
+            }
+            HakoOp::ExportGraph { collection, direction, edge, via } => {
+                let spec = build_traverse_spec(&TraverseInput {
+                    direction, edge, via, node_match: None,
+                    max_depth: default_traverse_depth(),
+                    k: default_traverse_k(),
+                    weight: None,
+                    edge_type: None,
+                    edge_match: None,
+                    include_path: false,
+                    include_via: false,
+                })?;
+                let json = gateway.db.export_graph_json(&collection, &spec).map_err(|e| e.to_string())?;
+                let value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::ValueResult { value: Some(value) })
+            }
         }
     })
     .await
@@ -1050,6 +1596,60 @@ pub async fn hako_exec<R: Runtime>(
     to_binary_payload(&res)
 }
 
+
+/// Wire traversal input -> engine [`TraverseSpec`]. Shared by FindPaths,
+/// FindSimplePaths, GraphAnalysis and ExportGraph.
+fn build_traverse_spec(input: &TraverseInput) -> Result<hakodb::index::traverse::TraverseSpec, String> {
+    let prop = |m: &Option<PropMatch>| -> Result<Option<(String, Value)>, String> {
+        m.as_ref().map(|pm| Ok((pm.field.clone(), json_value_to_value(&pm.value)?)))
+            .transpose()
+    };
+    Ok(hakodb::index::traverse::TraverseSpec {
+        direction: input.direction.engine(),
+        edge_field: input.edge.clone(),
+        max_depth: input.max_depth,
+        limit: input.k,
+        via_edge: input.via.clone(),
+        weight_field: input.weight.clone(),
+        node_match: prop(&input.node_match)?,
+        edge_type: prop(&input.edge_type)?,
+        edge_match: prop(&input.edge_match)?,
+        include_path: input.include_path,
+        include_via: input.include_via,
+    })
+}
+
+/// Runs one traversal (BFS/weighted via `find_paths`, or the cycle-safe
+/// simple-path enumeration) and maps hits to the wire shape.
+fn run_find_paths(
+    db: &Hako,
+    collection: String,
+    doc_id: String,
+    input: TraverseInput,
+    simple: bool,
+) -> Result<HakoResponse, String> {
+    let spec = build_traverse_spec(&input)?;
+    let rows = if simple {
+        db.find_simple_paths(&collection, &doc_id, &spec).map_err(|e| e.to_string())?
+    } else {
+        db.find_paths(&collection, &doc_id, &spec).map_err(|e| e.to_string())?
+    };
+    let mut hits = Vec::with_capacity(rows.len());
+    for h in &rows {
+        hits.push(PathHit {
+            collection: h.collection.clone(),
+            id: h.id.clone(),
+            depth: h.depth as u64,
+            cost: h.cost,
+            doc: doc_to_json_value(&h.id, &h.doc)?,
+            path: input.include_path.then(|| {
+                h.path.iter().map(|(c, i)| PathNode { collection: c.clone(), id: i.clone() }).collect()
+            }),
+            via: input.include_via.then(|| h.via.clone()),
+        });
+    }
+    Ok(HakoResponse::PathResult { hits })
+}
 
 /// Builds an engine [`Query`] from a decoded [`QueryInput`].
 fn build_query_from_input(input: &QueryInput) -> Result<Query, String> {
@@ -1316,6 +1916,127 @@ mod casing_tests {
             v,
             serde_json::json!({"records": { "list": [{ "col": "c", "id": "a" }]}})
         );
+    }
+
+    #[test]
+    fn parity_ops_wire_shapes() {
+        // 0.19.4-parity ops: snake_case tags, optional fields omitted by old
+        // clients ride their defaults, and bool flags default off.
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"transaction","steps":[
+                {"kind":"get","collection":"c","doc_id":"a"},
+                {"kind":"set","collection":"c","doc_id":"b","data":{"x":1}},
+                {"kind":"delete","collection":"c","doc_id":"a"}]}"#,
+        )
+        .expect("minimal transaction must parse");
+        match op {
+            HakoOp::Transaction { steps, max_attempts } => {
+                assert_eq!(steps.len(), 3);
+                assert!(!steps[2].force, "old clients omit force -> soft delete");
+                assert_eq!(max_attempts, 3, "default attempts");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"pipeline","collection":"c","stages":[{"stage":"match","filters":[{"field":"x","op":"eq","value":1}]},{"stage":"sort","field":"y"},{"stage":"group","key":"k","accums":[{"out":"n","kind":"count"}]}]}"#,
+        )
+        .expect("pipeline must parse");
+        assert!(matches!(op, HakoOp::Pipeline { .. }));
+
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"drop_index","kind":"composite","collection":"c","id":7}"#,
+        )
+        .expect("drop_index must parse");
+        match op {
+            HakoOp::DropIndex { kind, field, id, .. } => {
+                assert!(matches!(kind, DropIndexKind::Composite));
+                assert_eq!(field, None);
+                assert_eq!(id, Some(7));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"find_near","collection":"c","field":"v","query":[1,2],"k":5,
+                "max_distance":0.5,
+                "filters":[{"field":"tag","op":"eq","value":"x"}]}"#,
+        )
+        .expect("hybrid find_near must parse");
+        match op {
+            HakoOp::FindNear { max_distance, filters, .. } => {
+                assert_eq!(max_distance, Some(0.5));
+                assert_eq!(filters.len(), 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let minimal: HakoOp = serde_json::from_str(
+            r#"{"op":"find_near","collection":"c","field":"v","query":[1]}"#,
+        )
+        .expect("old find_near must parse");
+        match minimal {
+            HakoOp::FindNear { max_distance, filters, k, .. } => {
+                assert_eq!(max_distance, None);
+                assert!(filters.is_empty());
+                assert_eq!(k, 10);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"find_simple_paths","collection":"c","doc_id":"a","include_path":true}"#,
+        )
+        .expect("find_simple_paths must parse");
+        match op {
+            HakoOp::FindSimplePaths { include_path, node_match, .. } => {
+                assert!(include_path);
+                assert!(node_match.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        for (json, tag) in [
+            (r#"{"op":"get_versioned","collection":"c","doc_id":"a"}"#, "get_versioned"),
+            (r#"{"op":"get_by_ref","reference":{"__ref__":"c/a"}}"#, "get_by_ref"),
+            (r#"{"op":"quiescence"}"#, "quiescence"),
+            (r#"{"op":"set_read_only","enabled":true}"#, "set_read_only"),
+            (r#"{"op":"replicate","collection":"c"}"#, "replicate"),
+        ] {
+            serde_json::from_str::<HakoOp>(json).unwrap_or_else(|e| panic!("{tag}: {e}"));
+        }
+        let op: HakoOp = serde_json::from_str(r#"{"op":"replicate","collection":"c","doc_id":"a"}"#)
+            .expect("replicate with doc_id must parse");
+        assert!(matches!(op, HakoOp::Replicate { doc_id: Some(_), .. }));
+
+        let res = HakoResponse::TransactionResult {
+            docs: vec![Some(serde_json::json!({"id": "a"})), None],
+        };
+        let v = serde_json::to_value(&res).expect("serializes");
+        assert_eq!(v, serde_json::json!({"transaction_result": {"docs": [{"id": "a"}, null]}}));
+
+        let res = HakoResponse::DocumentVersion {
+            data: Some(serde_json::json!({"id": "a"})),
+            version: 9,
+        };
+        let v = serde_json::to_value(&res).expect("serializes");
+        assert_eq!(v, serde_json::json!({"document_version": {"data": {"id": "a"}, "version": 9}}));
+
+        let res = HakoResponse::DropResult {
+            docs_removed: 3,
+            bytes_reclaimed: 4096,
+            collections_dropped: vec!["c".into()],
+        };
+        let v = serde_json::to_value(&res).expect("serializes");
+        assert_eq!(
+            v,
+            serde_json::json!({"drop_result": {"docs_removed": 3, "bytes_reclaimed": 4096, "collections_dropped": ["c"]}})
+        );
+
+        let res = HakoResponse::NearBatchResult {
+            results: vec![vec![NearHit { id: "a".into(), score: 0.5, doc: serde_json::json!({}) }]],
+        };
+        let v = serde_json::to_value(&res).expect("serializes");
+        assert_eq!(v, serde_json::json!({"near_batch_result": {"results": [[{"id": "a", "score": 0.5, "doc": {}}]]}}));
     }
 
     #[test]
