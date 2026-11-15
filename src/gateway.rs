@@ -116,6 +116,9 @@ pub enum HakoOp {
         ef_construction: Option<usize>,
         #[serde(default)]
         ef_search: Option<usize>,
+        /// Popcount stage-1 (#190); omitted by old clients -> int8 stage-1.
+        #[serde(default)]
+        binary_stage1: bool,
     },
     CreateTraverseIndex {
         collection: String,
@@ -380,6 +383,57 @@ pub enum HakoOp {
         #[serde(default)]
         via: Option<String>,
     },
+    /// Personalized PageRank (#196): teleport mass `1 - damping` on the
+    /// seed set; omitted/empty seeds = classic PageRank. damping 0 rides
+    /// the engine default (0.85); top 0 = all nodes. Rows {node, score}
+    /// score desc then node asc.
+    GraphPagerank {
+        collection: String,
+        /// Seeds as `["col/id", ...]`.
+        #[serde(default)]
+        seeds: Option<Vec<String>>,
+        #[serde(default)]
+        direction: TraverseDirection,
+        #[serde(default)]
+        edge: Option<String>,
+        #[serde(default)]
+        via: Option<String>,
+        #[serde(default)]
+        node_match: Option<PropMatch>,
+        #[serde(default)]
+        damping: f64,
+        #[serde(default)]
+        top: usize,
+    },
+    /// Seed-scoped N-hop subgraph (#198): the export-graph node/edge
+    /// shape scoped to one seed. Missing seed = empty graph.
+    Subgraph {
+        collection: String,
+        seed_id: String,
+        #[serde(default = "default_traverse_depth")]
+        max_depth: usize,
+        #[serde(default)]
+        direction: TraverseDirection,
+        #[serde(default)]
+        edge: Option<String>,
+        #[serde(default)]
+        via: Option<String>,
+        #[serde(default)]
+        node_match: Option<PropMatch>,
+    },
+    /// Hybrid retrieval (#193): FTS (sparse) + KNN (dense) fused with
+    /// RRF. Rows {id, score (fused, desc), doc}; rrf_k 0 rides the
+    /// engine default (60).
+    HybridSearch {
+        collection: String,
+        text_field: String,
+        text_query: String,
+        vec_field: String,
+        query: Vec<f32>,
+        k: usize,
+        #[serde(default)]
+        rrf_k: usize,
+    },
     /// Point read with the storage version attached (optimistic
     /// concurrency on the client).
     GetVersioned { collection: String, doc_id: String },
@@ -456,6 +510,9 @@ pub enum HakoResponse {
     NearResult { hits: Vec<NearHit> },
     /// Batched KNN: one result set per query vector, aligned 1:1.
     NearBatchResult { results: Vec<Vec<NearHit>> },
+    /// Hybrid RRF hits: fused score desc (higher is better, unlike
+    /// NearHit's distance).
+    HybridResult { hits: Vec<HybridHit> },
     /// Graph BFS hits in walk order (collection + id: paths cross
     /// collections; depth = hops from the anchor).
     PathResult { hits: Vec<PathHit> },
@@ -500,6 +557,14 @@ pub struct PathNode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct NearHit {
+    pub id: String,
+    pub score: f64,
+    pub doc: serde_json::Value,
+}
+
+/// Hybrid retrieval row (#193): fused RRF score, higher is better.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridHit {
     pub id: String,
     pub score: f64,
     pub doc: serde_json::Value,
@@ -1040,11 +1105,12 @@ pub async fn hako_exec<R: Runtime>(
                 gateway.db.persist_index_defs().map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
             }
-            HakoOp::CreateVectorIndex { collection, field, dim, metric, m, ef_construction, ef_search } => {
+            HakoOp::CreateVectorIndex { collection, field, dim, metric, m, ef_construction, ef_search, binary_stage1 } => {
                 let params = hakodb::index::vector::HnswParams {
                     m,
                     ef_construction,
                     ef_search,
+                    binary_stage1,
                 };
                 gateway.db.create_vector_index_with_params(&collection, &field, dim, metric.metric(), params).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
@@ -1588,6 +1654,59 @@ pub async fn hako_exec<R: Runtime>(
                 let json = gateway.db.export_graph_json(&collection, &spec).map_err(|e| e.to_string())?;
                 let value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::ValueResult { value: Some(value) })
+            }
+            HakoOp::GraphPagerank { collection, seeds, direction, edge, via, node_match, damping, top } => {
+                let spec = build_traverse_spec(&TraverseInput {
+                    direction, edge, via, node_match,
+                    max_depth: default_traverse_depth(),
+                    k: default_traverse_k(),
+                    weight: None,
+                    edge_type: None,
+                    edge_match: None,
+                    include_path: false,
+                    include_via: false,
+                })?;
+                let seed_nodes: Vec<(String, String)> = seeds
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|s| s.split_once('/').map(|(c, id)| (c.to_string(), id.to_string())))
+                    .collect();
+                // 0 rides the engine default, mirroring the FFI contract.
+                let damping = if damping == 0.0 { 0.85 } else { damping };
+                let rows = gateway.db.graph_pagerank(&collection, &seed_nodes, &spec, damping, top).map_err(|e| e.to_string())?;
+                let value = serde_json::to_value(
+                    rows.into_iter()
+                        .map(|((col, id), score)| serde_json::json!({"node": format!("{col}/{id}"), "score": score}))
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(HakoResponse::ValueResult { value: Some(value) })
+            }
+            HakoOp::Subgraph { collection, seed_id, max_depth, direction, edge, via, node_match } => {
+                let spec = build_traverse_spec(&TraverseInput {
+                    direction, edge, via, node_match,
+                    max_depth,
+                    k: default_traverse_k(),
+                    weight: None,
+                    edge_type: None,
+                    edge_match: None,
+                    include_path: false,
+                    include_via: false,
+                })?;
+                let json = gateway.db.subgraph_json(&collection, &seed_id, &spec).map_err(|e| e.to_string())?;
+                let value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::ValueResult { value: Some(value) })
+            }
+            HakoOp::HybridSearch { collection, text_field, text_query, vec_field, query, k, rrf_k } => {
+                // 0 rides the engine default, mirroring the FFI contract.
+                let rrf_k = if rrf_k == 0 { 60 } else { rrf_k };
+                let rows = gateway.db.hybrid_search(&collection, &text_field, &text_query, &vec_field, &query, k, rrf_k).map_err(|e| e.to_string())?;
+                let mut hits = Vec::with_capacity(rows.len());
+                for (id, score, doc) in rows {
+                    let json = doc_to_json_value(&id, &doc)?;
+                    hits.push(HybridHit { id, score, doc: json });
+                }
+                Ok(HakoResponse::HybridResult { hits })
             }
         }
     })
@@ -2153,6 +2272,80 @@ mod casing_tests {
             }
             _ => panic!("wrong variant"),
         }
+        // binary_stage1 omittable -> false (old clients keep int8).
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"create_vector_index","collection":"docs","field":"emb","dim":2}"#,
+        )
+        .expect("must parse");
+        assert!(matches!(
+            op,
+            HakoOp::CreateVectorIndex { binary_stage1: false, .. }
+        ));
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"create_vector_index","collection":"docs","field":"emb","dim":2,"binary_stage1":true}"#,
+        )
+        .expect("must parse");
+        assert!(matches!(
+            op,
+            HakoOp::CreateVectorIndex { binary_stage1: true, .. }
+        ));
+    }
+
+    #[test]
+    fn graphrag_wire_shapes() {
+        // Pagerank: everything but collection omittable; seeds parse.
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"graph_pagerank","collection":"g"}"#,
+        )
+        .expect("must parse");
+        assert!(matches!(
+            op,
+            HakoOp::GraphPagerank { seeds: None, damping: 0.0, top: 0, .. }
+        ));
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"graph_pagerank","collection":"g","seeds":["g/a","g/b"],"damping":0.9,"top":5}"#,
+        )
+        .expect("must parse");
+        match op {
+            HakoOp::GraphPagerank { seeds, damping, top, .. } => {
+                assert_eq!(seeds, Some(vec!["g/a".into(), "g/b".into()]));
+                assert!((damping - 0.9).abs() < 1e-12);
+                assert_eq!(top, 5);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // Subgraph: max_depth omittable -> 10; seed_id required.
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"subgraph","collection":"g","seed_id":"a"}"#,
+        )
+        .expect("must parse");
+        match op {
+            HakoOp::Subgraph { seed_id, max_depth, .. } => {
+                assert_eq!(seed_id, "a");
+                assert_eq!(max_depth, 10);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // HybridSearch: rrf_k omittable -> 0 (engine default 60).
+        let op: HakoOp = serde_json::from_str(
+            r#"{"op":"hybrid_search","collection":"docs","text_field":"title","text_query":"cat","vec_field":"emb","query":[1.0],"k":5}"#,
+        )
+        .expect("must parse");
+        match op {
+            HakoOp::HybridSearch { k, rrf_k, .. } => {
+                assert_eq!(k, 5);
+                assert_eq!(rrf_k, 0);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let res = HakoResponse::HybridResult {
+            hits: vec![HybridHit { id: "a".into(), score: 0.5, doc: serde_json::json!({"id": "a"}) }],
+        };
+        let v = serde_json::to_value(&res).expect("serializes");
+        assert_eq!(
+            v,
+            serde_json::json!({"hybrid_result": {"hits": [{"id": "a", "score": 0.5, "doc": {"id": "a"}}]}})
+        );
     }
 
     #[test]
