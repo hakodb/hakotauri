@@ -420,6 +420,9 @@ pub enum HakoOp {
         via: Option<String>,
         #[serde(default)]
         node_match: Option<PropMatch>,
+        /// #217 P0-B: prune node docs to these fields (None = legacy).
+        #[serde(default)]
+        fields: Option<Vec<String>>,
     },
     /// Hybrid retrieval (#193): FTS (sparse) + KNN (dense) fused with
     /// RRF. Rows {id, score (fused, desc), doc}; rrf_k 0 rides the
@@ -433,6 +436,18 @@ pub enum HakoOp {
         k: usize,
         #[serde(default)]
         rrf_k: usize,
+        /// Optional metadata predicates evaluated on both RRF sides.
+        #[serde(default)]
+        filters: Vec<FilterInput>,
+    },
+    /// #217 P2: idempotent boot-time index declaration.
+    EnsureIndexes {
+        #[serde(default)]
+        fts: Vec<(String, String)>,
+        #[serde(default)]
+        vector: Vec<(String, String, u32, VectorMetric)>,
+        #[serde(default)]
+        tracked: Vec<String>,
     },
     /// Point read with the storage version attached (optimistic
     /// concurrency on the client).
@@ -1535,6 +1550,16 @@ pub async fn hako_exec<R: Runtime>(
                 gateway.db.persist_index_defs().map_err(|e| e.to_string())?;
                 Ok(HakoResponse::Ok)
             }
+            HakoOp::EnsureIndexes { fts, vector, tracked } => {
+                let mut schema = hakodb::engine::IndexSchema::default();
+                schema.fts = fts;
+                schema.vector = vector.into_iter()
+                    .map(|(c, f, dim, metric)| (c, f, dim, metric.metric()))
+                    .collect();
+                schema.tracked = tracked;
+                gateway.db.ensure_indexes(&schema).map_err(|e| e.to_string())?;
+                Ok(HakoResponse::Ok)
+            }
             HakoOp::GetVersioned { collection, doc_id } => {
                 match gateway.db.get_versioned(&collection, &doc_id).map_err(|e| e.to_string())? {
                     Some((doc, version)) => {
@@ -1682,7 +1707,7 @@ pub async fn hako_exec<R: Runtime>(
                 .map_err(|e| e.to_string())?;
                 Ok(HakoResponse::ValueResult { value: Some(value) })
             }
-            HakoOp::Subgraph { collection, seed_id, max_depth, direction, edge, via, node_match } => {
+            HakoOp::Subgraph { collection, seed_id, max_depth, direction, edge, via, node_match, fields } => {
                 let spec = build_traverse_spec(&TraverseInput {
                     direction, edge, via, node_match,
                     max_depth,
@@ -1693,14 +1718,23 @@ pub async fn hako_exec<R: Runtime>(
                     include_path: false,
                     include_via: false,
                 })?;
-                let json = gateway.db.subgraph_json(&collection, &seed_id, &spec).map_err(|e| e.to_string())?;
+                let json = gateway.db.subgraph_json_projected(
+                    &collection, &seed_id, &spec, fields.as_deref()
+                ).map_err(|e| e.to_string())?;
                 let value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
                 Ok(HakoResponse::ValueResult { value: Some(value) })
             }
-            HakoOp::HybridSearch { collection, text_field, text_query, vec_field, query, k, rrf_k } => {
+            HakoOp::HybridSearch { collection, text_field, text_query, vec_field, query, k, rrf_k, filters } => {
                 // 0 rides the engine default, mirroring the FFI contract.
                 let rrf_k = if rrf_k == 0 { 60 } else { rrf_k };
-                let rows = gateway.db.hybrid_search(&collection, &text_field, &text_query, &vec_field, &query, k, rrf_k).map_err(|e| e.to_string())?;
+                let rows = if filters.is_empty() {
+                    gateway.db.hybrid_search(&collection, &text_field, &text_query, &vec_field, &query, k, rrf_k).map_err(|e| e.to_string())?
+                } else {
+                    let engine_filters = build_filters(&filters)?;
+                    gateway.db.hybrid_search_filtered(
+                        &collection, &text_field, &text_query, &vec_field, &query, k, rrf_k, &engine_filters
+                    ).map_err(|e| e.to_string())?
+                };
                 let mut hits = Vec::with_capacity(rows.len());
                 for (id, score, doc) in rows {
                     let json = doc_to_json_value(&id, &doc)?;
@@ -1869,6 +1903,17 @@ fn map_operator(op: &FilterOperator) -> Operator {
         FilterOperator::ArrayContains => Operator::ArrayContains,
         FilterOperator::ArrayContainsAny => Operator::ArrayContainsAny,
     }
+}
+
+/// Build engine filters from frontend filter inputs (issue #238 wave parity).
+fn build_filters(inputs: &[FilterInput]) -> Result<Vec<Filter>, String> {
+    inputs.iter().map(|f| {
+        Ok(Filter {
+            field: f.field.clone(),
+            op: map_operator(&f.op),
+            value: json_value_to_value(&f.value)?,
+        })
+    }).collect()
 }
 
 /// Request JSON object to a stored document (Set / Batch-Set).
